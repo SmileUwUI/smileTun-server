@@ -62,6 +62,7 @@ func (s *Server) Start() error {
 	log.Printf("TCP proxy server listening on %s", addr)
 
 	go s.acceptConnections()
+	go s.cleanupIdleClients()
 
 	for {
 
@@ -154,7 +155,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	copy(packet[:12], nonce)
 	copy(packet[12:], rawSaltPacket)
 
-	if _, err := conn.Write(crypto.Trashfication(packet, 120, 1420)); err != nil {
+	if _, err := conn.Write(crypto.Trashfication(packet, 400, 1300)); err != nil {
 		log.Printf("Failed to send salt: %v", err)
 		return
 	}
@@ -165,6 +166,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 	sessionKeyHasher.Write(password[:])
 	sessionKeyHasher.Write([]byte(":"))
 	sessionKeyHasher.Write(salt)
+
+	log.Printf("New client %s", conn.RemoteAddr())
 
 	s.addClient(conn, user, sessionKeyHasher.Sum(nil))
 	conn.SetDeadline(time.Time{})
@@ -185,6 +188,28 @@ func (s *Server) addClient(conn net.Conn, user *users.User, sessionKey []byte) {
 		sessionKey: sessionKey,
 		createdAt:  time.Now(),
 		lastActive: time.Now(),
+	}
+}
+
+func (s *Server) cleanupIdleClients() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			for addr, client := range s.clients {
+				if time.Since(client.lastActive) > 10*time.Minute {
+					log.Printf("Closing idle client: %s", addr)
+					client.conn.Close()
+					delete(s.clients, addr)
+				}
+			}
+			s.mu.Unlock()
+		}
 	}
 }
 
