@@ -107,13 +107,13 @@ func (s *Server) acceptConnections() {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer s.decrementClientCount()
-	defer conn.Close()
 
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	firstPacket := make([]byte, FirstPacketSize)
 	if _, err := io.ReadFull(conn, firstPacket); err != nil {
 		log.Printf("Failed to read first packet from %s: %v", conn.RemoteAddr(), err)
+		conn.Close()
 		return
 	}
 
@@ -122,6 +122,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	plainPacket, err := crypto.DecryptChaCha20Poly1305(firstPacket[12:], nonce, s.config.InitPassword[:])
 	if err != nil {
 		log.Printf("Failed to decrypt first packet from %s: %v", conn.RemoteAddr(), err)
+		conn.Close()
 		return
 	}
 
@@ -130,6 +131,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	if currentTime-timestamp > 5 {
 		log.Printf("Invalid timestamp from %s: %d (current: %d)", conn.RemoteAddr(), timestamp, currentTime)
+		conn.Close()
 		return
 	}
 
@@ -139,6 +141,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	user := s.users.GetUser(username)
 	if user == nil {
 		log.Printf("User not found from %s: %x", conn.RemoteAddr(), username)
+		conn.Close()
 		return
 	}
 
@@ -148,6 +151,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	if err != nil {
 		log.Printf("Failed to encrypt salt: %v", err)
+		conn.Close()
 		return
 	}
 
@@ -157,6 +161,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	if _, err := conn.Write(crypto.Trashfication(packet, 400, 1300)); err != nil {
 		log.Printf("Failed to send salt: %v", err)
+		conn.Close()
 		return
 	}
 
@@ -169,17 +174,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	log.Printf("New client %s", conn.RemoteAddr())
 
-	s.addClient(conn, user, sessionKeyHasher.Sum(nil))
+	client := s.addClient(conn, user, sessionKeyHasher.Sum(nil))
 	conn.SetDeadline(time.Time{})
+
+	go s.handleClient(client)
 }
 
-func (s *Server) addClient(conn net.Conn, user *users.User, sessionKey []byte) {
+func (s *Server) addClient(conn net.Conn, user *users.User, sessionKey []byte) (client *Client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	addr := conn.RemoteAddr().String()
 
-	s.clients[addr] = &Client{
+	client = &Client{
 		addr:       addr,
 		conn:       conn,
 		user:       user,
@@ -189,6 +196,10 @@ func (s *Server) addClient(conn net.Conn, user *users.User, sessionKey []byte) {
 		createdAt:  time.Now(),
 		lastActive: time.Now(),
 	}
+
+	s.clients[addr] = client
+
+	return client
 }
 
 func (s *Server) cleanupIdleClients() {
@@ -209,6 +220,43 @@ func (s *Server) cleanupIdleClients() {
 				}
 			}
 			s.mu.Unlock()
+		}
+	}
+}
+
+func (s *Server) handleClient(client *Client) {
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+			encrypted := make([]byte, 4096)
+
+			_, err := client.conn.Read(encrypted)
+			if err != nil {
+				log.Printf("Socket read error (%s): %v", client.addr, err)
+				return
+			}
+			lenPacketBytes := encrypted[0:2]
+			log.Printf("%d", lenPacketBytes)
+
+			lenPacketBytes[0] = lenPacketBytes[0] ^ client.sessionKey[0]
+			lenPacketBytes[1] = lenPacketBytes[1] ^ client.sessionKey[1]
+
+			lenPacket := binary.BigEndian.Uint16(lenPacketBytes)
+			if lenPacket+2 > 4096 {
+				continue
+			}
+
+			cipherPacket := encrypted[2:lenPacket]
+
+			plaintText, err := crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], client.sessionKey)
+			if err != nil {
+				log.Printf("Decryption error: %v", err)
+				continue
+			}
+
+			log.Printf("%d", plaintText)
 		}
 	}
 }
