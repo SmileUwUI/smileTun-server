@@ -4,10 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"smiletun-server/config"
-	"smiletun-server/crypto"
 	"smiletun-server/logger"
 	"smiletun-server/users"
 	"sync"
@@ -29,6 +27,7 @@ type Client struct {
 	sessionKey     []byte
 	createdAt      time.Time
 	lastActive     time.Time
+	logger         *logger.Logger
 	mu             sync.RWMutex
 }
 
@@ -148,131 +147,39 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.logger.Info("Connection from %s closed", clientAddr)
 	}()
 
-	s.logger.Debug("Setting read deadline to 15 seconds for %s", clientAddr)
-	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	connTCP := conn.(*net.TCPConn)
+	connTCP.SetNoDelay(true)
 
-	s.logger.Debug("Reading first packet from %s (size: %d bytes)", clientAddr, FirstPacketSize)
-	firstPacket := make([]byte, FirstPacketSize)
-	if _, err := io.ReadFull(conn, firstPacket); err != nil {
-		s.logger.Error("Failed to read first packet from %s: %v", clientAddr, err)
-		conn.Close()
-		return
+	now := time.Now()
+
+	client := &Client{
+		addr:           conn.RemoteAddr().String(),
+		conn:           connTCP,
+		countRecv:      0,
+		countSent:      0,
+		countRecvBytes: 0,
+		countSentBytes: 0,
+		sessionKey:     []byte{},
+		createdAt:      now,
+		lastActive:     now,
+		logger:         s.logger,
 	}
-	s.logger.Debug("First packet received from %s", clientAddr)
 
-	nonce := firstPacket[:12]
-	s.logger.Trace("Extracted nonce from %s: %x", clientAddr, nonce)
-
-	s.logger.Debug("Decrypting first packet from %s with init password", clientAddr)
-	plainPacket, err := crypto.DecryptChaCha20Poly1305(firstPacket[12:], nonce, s.config.InitPassword[:])
+	err := client.handshakeStage1(s.config.InitPassword, s.users)
 	if err != nil {
-		s.logger.Error("Failed to decrypt first packet from %s: %v", clientAddr, err)
-		conn.Close()
+		s.logger.Error("Error during handshake: %v", err)
 		return
 	}
-	s.logger.Debug("First packet decrypted successfully from %s", clientAddr)
-
-	timestamp := int64(binary.BigEndian.Uint64(plainPacket[16:24]))
-	currentTime := time.Now().Unix()
-	timeDiff := currentTime - timestamp
-
-	s.logger.Debug("Timestamp from %s: %d, current: %d, diff: %d", clientAddr, timestamp, currentTime, timeDiff)
-
-	if timeDiff > 5 {
-		s.logger.Debug("Invalid timestamp from %s: %d (current: %d), diff: %d", clientAddr, timestamp, currentTime, timeDiff)
-		conn.Close()
-		return
-	}
-	s.logger.Debug("Timestamp validation passed for %s", clientAddr)
-
-	var username [16]byte
-	copy(username[:], plainPacket[:16])
-	s.logger.Debug("Extracted username from %s: %x", clientAddr, username)
-
-	s.logger.Debug("Looking up user %x in database", username)
-	user := s.users.GetUser(username)
-	if user == nil {
-		s.logger.Debug("User not found from %s: %x", clientAddr, username)
-		conn.Close()
-		return
-	}
-	s.logger.Info("User %x authenticated successfully from %s", username[:8], clientAddr)
-
-	s.logger.Debug("Generating 32-byte salt for %s", clientAddr)
-	salt := crypto.RandomBytes(32)
-	s.logger.Trace("Generated salt for %s: %x", clientAddr, salt)
-
-	s.logger.Debug("Encrypting salt with init password for %s", clientAddr)
-	rawSaltPacket, nonce, err := crypto.EncryptChaCha20Poly1305(salt, s.config.InitPassword[:])
-
-	if err != nil {
-		s.logger.Error("Failed to encrypt salt for %s: %v", clientAddr, err)
-		conn.Close()
-		return
-	}
-	s.logger.Debug("Salt encrypted successfully for %s", clientAddr)
-
-	packet := make([]byte, len(rawSaltPacket)+len(nonce))
-	copy(packet[:12], nonce)
-	copy(packet[12:], rawSaltPacket)
-
-	trashPacket := crypto.Trashfication(packet, 400, 1300)
-	s.logger.Debug("Sending salt packet to %s (size: %d bytes, after trash: %d)", clientAddr, len(packet), len(trashPacket))
-
-	if _, err := conn.Write(trashPacket); err != nil {
-		s.logger.Error("Failed to send salt to %s: %v", clientAddr, err)
-		conn.Close()
-		return
-	}
-	s.logger.Debug("Salt packet sent to %s", clientAddr)
-
-	s.logger.Debug("Deriving session key for %s", clientAddr)
-	sessionKeyHasher := sha256.New()
-	password := user.GetPassword()
-
-	sessionKeyHasher.Write(password[:])
-	sessionKeyHasher.Write([]byte(":"))
-	sessionKeyHasher.Write(salt)
-	sessionKey := sessionKeyHasher.Sum(nil)
-	s.logger.Debug("Session key derived for %s", clientAddr)
 
 	s.logger.Info("New client registered: %s", clientAddr)
 
 	s.logger.Debug("Adding client %s to clients map", clientAddr)
-	client := s.addClient(conn, user, sessionKey)
 
 	s.logger.Debug("Removing read deadline for %s", clientAddr)
 	conn.SetDeadline(time.Time{})
 
 	s.logger.Debug("Starting client handler goroutine for %s", clientAddr)
 	go s.handleClient(client)
-}
-
-func (s *Server) addClient(conn net.Conn, user *users.User, sessionKey []byte) (client *Client) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	addr := conn.RemoteAddr().String()
-	s.logger.Debug("Adding client %s to server registry", addr)
-
-	connTCP := conn.(*net.TCPConn)
-	connTCP.SetNoDelay(true)
-
-	client = &Client{
-		addr:           addr,
-		conn:           connTCP,
-		user:           user,
-		countRecvBytes: 0,
-		countSentBytes: 0,
-		sessionKey:     sessionKey,
-		createdAt:      time.Now(),
-		lastActive:     time.Now(),
-	}
-
-	s.clients[addr] = client
-	s.logger.Info("Client %s added successfully, total clients: %d", addr, len(s.clients))
-
-	return client
 }
 
 func (s *Server) cleanupIdleClients() {
