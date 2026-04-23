@@ -352,6 +352,10 @@ func (s *Server) handleClient(client *Client) {
 
 			lenPacket := binary.BigEndian.Uint16(lenCipherPacketBytes)
 			s.logger.Debug("Packet length from %s: %d bytes", clientAddr, lenPacket)
+			if lenPacket > uint16(n) {
+				s.logger.Error("Error: The length of the encrypted data exceeds the total length from %s", clientAddr)
+				continue
+			}
 
 			cipherPacket := encrypted[2:lenPacket]
 			s.logger.Trace("Cipher packet from %s size: %d bytes", clientAddr, len(cipherPacket))
@@ -360,21 +364,16 @@ func (s *Server) handleClient(client *Client) {
 			plainText, err := crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], client.sessionKey)
 			if err != nil {
 				s.logger.Error("Decryption error for packet #%d from %s: %v", client.countRecv, clientAddr, err)
-				continue
+				return
 			}
 			client.countRecv++
 
-			if len(plainText) <= 9 {
+			if len(plainText) <= 12 {
 				s.logger.Info("The length of the decrypted packet is too short")
 				continue
 			}
 
-			serialNumber := binary.BigEndian.Uint32(plainText[0:4])
-			salt := plainText[4:12]
-			if serialNumber != client.countRecv {
-				s.logger.Info("An attempt at a reply attack on address %s has been detected", clientAddr)
-				continue
-			}
+			salt := plainText[0:8]
 
 			s.logger.Debug("Recalculation of the session key for address %s", clientAddr)
 			client.computeNextSessionKey(salt)
