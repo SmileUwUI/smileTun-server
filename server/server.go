@@ -19,15 +19,26 @@ import (
 const FirstPacketSize = chacha20poly1305.NonceSize + 16 + 8 + chacha20poly1305.Overhead // NonceSize + UsernameSize + TimestampSize + AEADtagSize
 
 type Client struct {
-	addr       string
-	conn       net.Conn
-	user       *users.User
-	countRecv  uint32
-	countSent  uint32
-	sessionKey []byte
-	createdAt  time.Time
-	lastActive time.Time
-	mu         sync.RWMutex
+	addr           string
+	conn           *net.TCPConn
+	user           *users.User
+	countRecv      uint32
+	countSent      uint32
+	countRecvBytes uint32
+	countSentBytes uint32
+	sessionKey     []byte
+	createdAt      time.Time
+	lastActive     time.Time
+	mu             sync.RWMutex
+}
+
+func (c *Client) computeNextSessionKey(salt []byte) {
+	hasher := sha256.New()
+	hasher.Write(c.sessionKey)
+	hasher.Write([]byte(":"))
+	hasher.Write(salt)
+
+	c.sessionKey = hasher.Sum(nil)
 }
 
 type Server struct {
@@ -237,15 +248,18 @@ func (s *Server) addClient(conn net.Conn, user *users.User, sessionKey []byte) (
 	addr := conn.RemoteAddr().String()
 	s.logger.Debug("Adding client %s to server registry", addr)
 
+	connTCP := conn.(*net.TCPConn)
+	connTCP.SetNoDelay(true)
+
 	client = &Client{
-		addr:       addr,
-		conn:       conn,
-		user:       user,
-		countRecv:  0,
-		countSent:  0,
-		sessionKey: sessionKey,
-		createdAt:  time.Now(),
-		lastActive: time.Now(),
+		addr:           addr,
+		conn:           connTCP,
+		user:           user,
+		countRecvBytes: 0,
+		countSentBytes: 0,
+		sessionKey:     sessionKey,
+		createdAt:      time.Now(),
+		lastActive:     time.Now(),
 	}
 
 	s.clients[addr] = client
@@ -290,10 +304,9 @@ func (s *Server) cleanupIdleClients() {
 }
 
 func (s *Server) handleClient(client *Client) {
+	defer client.conn.Close()
 	clientAddr := client.addr
 	s.logger.Info("Starting client handler for %s", clientAddr)
-
-	packetCount := 0
 
 	for {
 		select {
@@ -301,40 +314,44 @@ func (s *Server) handleClient(client *Client) {
 			s.logger.Info("Client handler for %s stopped by server shutdown", clientAddr)
 			return
 		default:
-			encrypted := make([]byte, 4096)
-
-			s.logger.Trace("Reading encrypted data from %s", clientAddr)
-			n, err := client.conn.Read(encrypted)
+			lenRawPacketBytes := make([]byte, 2)
+			n, err := client.conn.Read(lenRawPacketBytes)
 			if err != nil {
 				s.logger.Error("Socket read error from %s: %v", clientAddr, err)
 				return
 			}
 
-			packetCount++
-			s.logger.Debug("Received packet #%d from %s (size: %d bytes)", packetCount, clientAddr, n)
+			lenRawPacketBytes[0] = lenRawPacketBytes[0] ^ client.sessionKey[0]
+			lenRawPacketBytes[1] = lenRawPacketBytes[1] ^ client.sessionKey[1]
+			lenRawPacket := binary.BigEndian.Uint16(lenRawPacketBytes)
 
-			lenPacketBytes := encrypted[0:2]
-			s.logger.Trace("Length bytes from %s: %x", clientAddr, lenPacketBytes)
+			encrypted := make([]byte, lenRawPacket-2)
+			s.logger.Trace("Reading encrypted data from %s", clientAddr)
+			n, err = client.conn.Read(encrypted)
+			if err != nil {
+				s.logger.Error("Socket read error from %s: %v", clientAddr, err)
+				return
+			}
 
-			originalLenByte0 := lenPacketBytes[0]
-			originalLenByte1 := lenPacketBytes[1]
+			s.logger.Debug("Received packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, n)
 
-			lenPacketBytes[0] = lenPacketBytes[0] ^ client.sessionKey[0]
-			lenPacketBytes[1] = lenPacketBytes[1] ^ client.sessionKey[1]
+			lenCipherPacketBytes := encrypted[0:2]
+			s.logger.Trace("Length bytes from %s: %x", clientAddr, lenCipherPacketBytes)
+
+			originalLenByte0 := lenCipherPacketBytes[0]
+			originalLenByte1 := lenCipherPacketBytes[1]
+
+			lenCipherPacketBytes[0] = lenCipherPacketBytes[0] ^ client.sessionKey[2]
+			lenCipherPacketBytes[1] = lenCipherPacketBytes[1] ^ client.sessionKey[3]
 
 			s.logger.Trace("Decrypted length bytes for %s: %x -> %x (key: %x)",
 				clientAddr,
 				[]byte{originalLenByte0, originalLenByte1},
-				[]byte{lenPacketBytes[0], lenPacketBytes[1]},
+				[]byte{lenCipherPacketBytes[0], lenCipherPacketBytes[1]},
 				client.sessionKey[:2])
 
-			lenPacket := binary.BigEndian.Uint16(lenPacketBytes)
+			lenPacket := binary.BigEndian.Uint16(lenCipherPacketBytes)
 			s.logger.Debug("Packet length from %s: %d bytes", clientAddr, lenPacket)
-
-			if lenPacket+2 > 4096 {
-				s.logger.Debug("Invalid packet length from %s: %d (max: 4094), skipping", clientAddr, lenPacket)
-				continue
-			}
 
 			cipherPacket := encrypted[2:lenPacket]
 			s.logger.Trace("Cipher packet from %s size: %d bytes", clientAddr, len(cipherPacket))
@@ -342,20 +359,37 @@ func (s *Server) handleClient(client *Client) {
 			s.logger.Trace("Decrypting packet from %s", clientAddr)
 			plainText, err := crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], client.sessionKey)
 			if err != nil {
-				s.logger.Error("Decryption error for packet #%d from %s: %v", packetCount, clientAddr, err)
+				s.logger.Error("Decryption error for packet #%d from %s: %v", client.countRecv, clientAddr, err)
+				continue
+			}
+			client.countRecv++
+
+			if len(plainText) <= 9 {
+				s.logger.Info("The length of the decrypted packet is too short")
 				continue
 			}
 
-			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", packetCount, clientAddr, len(plainText))
+			serialNumber := binary.BigEndian.Uint32(plainText[0:4])
+			salt := plainText[4:12]
+			if serialNumber != client.countRecv {
+				s.logger.Info("An attempt at a reply attack on address %s has been detected", clientAddr)
+				continue
+			}
+
+			s.logger.Debug("Recalculation of the session key for address %s", clientAddr)
+			client.computeNextSessionKey(salt)
+
+			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, len(plainText))
 			s.logger.Trace("Plaintext data from %s: %x", clientAddr, plainText)
 
 			client.mu.Lock()
 			client.lastActive = time.Now()
-			client.countRecv += uint32(len(plainText))
+			client.countRecvBytes += uint32(len(plainText))
 			client.mu.Unlock()
 
 			s.logger.Debug("Client %s stats updated - received: %d bytes, total packets: %d",
-				clientAddr, client.countRecv, packetCount)
+				clientAddr, client.countRecvBytes, client.countRecv)
+			s.logger.Debug("______________________________________________________________________________")
 		}
 	}
 }
