@@ -335,55 +335,22 @@ func (s *Server) handleClient(client *Client) {
 
 			s.logger.Debug("Received packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, n)
 
-			lenCipherPacketBytes := encrypted[0:2]
-			s.logger.Trace("Length bytes from %s: %x", clientAddr, lenCipherPacketBytes)
-
-			originalLenByte0 := lenCipherPacketBytes[0]
-			originalLenByte1 := lenCipherPacketBytes[1]
-
-			lenCipherPacketBytes[0] = lenCipherPacketBytes[0] ^ client.sessionKey[2]
-			lenCipherPacketBytes[1] = lenCipherPacketBytes[1] ^ client.sessionKey[3]
-
-			s.logger.Trace("Decrypted length bytes for %s: %x -> %x (key: %x)",
-				clientAddr,
-				[]byte{originalLenByte0, originalLenByte1},
-				[]byte{lenCipherPacketBytes[0], lenCipherPacketBytes[1]},
-				client.sessionKey[:2])
-
-			lenPacket := binary.BigEndian.Uint16(lenCipherPacketBytes)
-			s.logger.Debug("Packet length from %s: %d bytes", clientAddr, lenPacket)
-			if lenPacket > uint16(n) {
-				s.logger.Error("Error: The length of the encrypted data exceeds the total length from %s", clientAddr)
-				continue
-			}
-
-			cipherPacket := encrypted[2:lenPacket]
-			s.logger.Trace("Cipher packet from %s size: %d bytes", clientAddr, len(cipherPacket))
-
-			s.logger.Trace("Decrypting packet from %s", clientAddr)
-			plainText, err := crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], client.sessionKey)
+			packet := NewEncryptedPacket(encrypted, s.logger)
+			err = packet.Decrypt(client.sessionKey, n, clientAddr)
 			if err != nil {
-				s.logger.Error("Decryption error for packet #%d from %s: %v", client.countRecv, clientAddr, err)
-				return
-			}
-			client.countRecv++
-
-			if len(plainText) <= 12 {
-				s.logger.Info("The length of the decrypted packet is too short")
+				s.logger.Error("Error processing the packet: %v", err)
 				continue
 			}
 
-			salt := plainText[0:8]
+			client.countRecv++
+			client.computeNextSessionKey(packet.Salt)
 
-			s.logger.Debug("Recalculation of the session key for address %s", clientAddr)
-			client.computeNextSessionKey(salt)
-
-			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, len(plainText))
-			s.logger.Trace("Plaintext data from %s: %x", clientAddr, plainText)
+			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, len(packet.Data))
+			s.logger.Trace("Plaintext data from %s: %x", clientAddr, packet.Data)
 
 			client.mu.Lock()
 			client.lastActive = time.Now()
-			client.countRecvBytes += uint32(len(plainText))
+			client.countRecvBytes += uint32(len(packet.Data))
 			client.mu.Unlock()
 
 			s.logger.Debug("Client %s stats updated - received: %d bytes, total packets: %d",
