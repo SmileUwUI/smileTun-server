@@ -10,11 +10,7 @@ import (
 	"smiletun-server/users"
 	"sync"
 	"time"
-
-	"golang.org/x/crypto/chacha20poly1305"
 )
-
-const FirstPacketSize = chacha20poly1305.NonceSize + 16 + 8 + chacha20poly1305.Overhead // NonceSize + UsernameSize + TimestampSize + AEADtagSize
 
 type Client struct {
 	addr           string
@@ -168,6 +164,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	err := client.handshakeStage1(s.config.InitPassword, s.users)
 	if err != nil {
 		s.logger.Error("Error during handshake: %v", err)
+		return
+	}
+
+	clientIP := s.ipPool.AcquireIP()
+	err = client.handshakeStage2(clientIP)
+	if err != nil {
+		s.logger.Error("Error during handshake: %v", err)
+		s.ipPool.ReleaseIP(clientIP)
 		return
 	}
 

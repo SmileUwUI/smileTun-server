@@ -4,11 +4,16 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
+	"net"
 	"smiletun-server/crypto"
 	"smiletun-server/users"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
+
+const FirstPacketSize = chacha20poly1305.NonceSize + 16 + 8 + chacha20poly1305.Overhead // NonceSize + UsernameSize + TimestampSize + AEADtagSize
+const ThirdPacketSize = chacha20poly1305.NonceSize + 1 + chacha20poly1305.Overhead      // NonceSize + MagicByteSize + AEADtagSize
 
 func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err error) {
 	clientAddr := c.conn.RemoteAddr().String()
@@ -18,7 +23,7 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 
 	c.logger.Debug("Reading first packet from %s (size: %d bytes)", clientAddr, FirstPacketSize)
 	firstPacket := make([]byte, 4096)
-	if _, err = io.ReadFull(c.conn, firstPacket); err != nil {
+	if _, err = c.conn.Read(firstPacket); err != nil {
 		c.logger.Error("Failed to read first packet from %s: %v", clientAddr, err)
 		c.conn.Close()
 		return err
@@ -90,6 +95,7 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 		c.conn.Close()
 		return err
 	}
+
 	c.logger.Debug("Salt packet sent to %s", clientAddr)
 
 	c.logger.Debug("Deriving session key for %s", clientAddr)
@@ -101,6 +107,52 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 	sessionKeyHasher.Write(salt)
 	c.sessionKey = sessionKeyHasher.Sum(nil)
 	c.logger.Debug("Session key derived for %s", clientAddr)
+
+	return nil
+}
+
+func (c *Client) handshakeStage2(clientIP net.IP) (err error) {
+	clientAddr := c.conn.RemoteAddr().String()
+
+	thirdPacket := make([]byte, 4096)
+	if _, err = c.conn.Read(thirdPacket); err != nil {
+		c.logger.Error("Failed to read third packet from %s: %v", clientAddr, err)
+		c.conn.Close()
+		return err
+	}
+
+	packet := thirdPacket[:ThirdPacketSize]
+	plainPacket, err := crypto.DecryptChaCha20Poly1305(packet[12:], packet[:12], c.sessionKey)
+	if err != nil {
+		c.logger.Error("Failed to decrypt first packet from %s: %v", clientAddr, err)
+		c.conn.Close()
+		return err
+	}
+
+	if plainPacket[0] != 0xFF {
+		c.conn.Close()
+		return fmt.Errorf("The client rejected the connection (addr: %s)", clientAddr)
+	}
+
+	plainIPPacket := make([]byte, 4)
+	copy(plainIPPacket[:4], clientIP.To4())
+
+	ciphetIPPacket, nonce, err := crypto.EncryptChaCha20Poly1305(plainIPPacket, c.sessionKey)
+	if err != nil {
+		c.logger.Error("Failed to encrypt ip for %s: %v", clientAddr, err)
+		c.conn.Close()
+		return
+	}
+
+	finallyPacket := make([]byte, len(ciphetIPPacket)+len(nonce))
+	copy(finallyPacket[:12], nonce)
+	copy(finallyPacket[12:], ciphetIPPacket)
+
+	if _, err = c.conn.Write(finallyPacket); err != nil {
+		c.logger.Error("Failed to send salt to %s: %v", clientAddr, err)
+		c.conn.Close()
+		return err
+	}
 
 	return nil
 }
