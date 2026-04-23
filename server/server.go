@@ -44,6 +44,7 @@ func (c *Client) computeNextSessionKey(salt []byte) {
 type Server struct {
 	config      *config.Config
 	users       *users.Users
+	ipPool      *IPPool
 	listener    net.Listener
 	wg          sync.WaitGroup
 	clientCount int32
@@ -54,15 +55,21 @@ type Server struct {
 	mu     sync.RWMutex
 }
 
-func NewServer(cfg *config.Config, usersDB *users.Users, logger *logger.Logger) *Server {
+func NewServer(cfg *config.Config, usersDB *users.Users, logger *logger.Logger) (server *Server, err error) {
 	logger.Info("Creating new server instance")
+	ippool, err := NewIPPool("10.8.83.0/24")
+	if err != nil {
+		return nil, fmt.Errorf("error creating ip pool: %v", err)
+	}
+
 	return &Server{
 		config:  cfg,
 		users:   usersDB,
+		ipPool:  ippool,
 		clients: make(map[string]*Client),
 		stopCh:  make(chan struct{}),
 		logger:  logger,
-	}
+	}, nil
 }
 
 func (s *Server) Start() error {
