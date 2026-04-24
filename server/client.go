@@ -59,7 +59,7 @@ func (c *Client) WriteAndEncryptPacket(packet []byte, minTrashficationLength int
 	if err != nil {
 		c.logger.Error("Failed to encrypt packet for %s: %v", c.addr, err)
 		c.conn.Close()
-		return
+		return err
 	}
 
 	packet = make([]byte, len(rawPacket)+len(nonce))
