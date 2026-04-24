@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"smiletun-server/config"
@@ -20,6 +19,7 @@ type Server struct {
 	clientCount int32
 	clients     map[string]*Client
 	logger      *logger.Logger
+	tunnel      *LinuxTunnel
 
 	stopCh chan struct{}
 	mu     sync.RWMutex
@@ -102,6 +102,28 @@ func (s *Server) acceptConnections() {
 			s.wg.Add(1)
 			s.incrementClientCount()
 			s.logger.Debug("Starting handle connection goroutine for %s", conn.RemoteAddr())
+
+			s.tunnel, err = NewTunnel(
+				"tun0",
+				1500,
+				net.ParseIP("10.8.83.1"),
+				net.IPv4Mask(255, 255, 255, 0),
+				[]*net.IPNet{
+					{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
+				},
+			)
+
+			if err != nil {
+				s.logger.Error("Failed to create tunnel: %v", err)
+				return
+			}
+
+			err = s.tunnel.Up()
+			if err != nil {
+				s.logger.Error("Failed to up tunnel: %v", err)
+				return
+			}
+
 			go s.handleConnection(conn)
 		}
 	}
@@ -144,7 +166,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	clientIP := s.ipPool.AcquireIP()
-	err = client.handshakeStage2(clientIP)
+	err = client.handshakeStage2(&clientIP)
 	if err != nil {
 		s.logger.Error("Error during handshake: %v", err)
 		s.ipPool.ReleaseIP(clientIP)
@@ -154,12 +176,56 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.logger.Info("New client registered: %s", clientAddr)
 
 	s.logger.Debug("Adding client %s to clients map", clientAddr)
+	s.clients[clientIP.String()] = client
 
 	s.logger.Debug("Removing read deadline for %s", clientAddr)
 	conn.SetDeadline(time.Time{})
 
 	s.logger.Debug("Starting client handler goroutine for %s", clientAddr)
 	go s.handleClient(client)
+}
+
+func (s *Server) handleClient(client *Client) {
+	defer client.conn.Close()
+	clientAddr := client.addr
+	s.logger.Info("Starting client handler for %s", clientAddr)
+
+	for {
+		select {
+		case <-s.stopCh:
+			s.logger.Info("Client handler for %s stopped by server shutdown", clientAddr)
+			return
+		default:
+			packet, err := client.ReadAndDecryptStreamingPacket()
+			if err != nil {
+				s.logger.Error("Failed to read and decrypt packet from %s: %v", client.addr, err)
+				if err.Error() == "EOF" {
+					return
+				}
+				continue
+			}
+
+			client.countRecv++
+			client.computeNextSessionKey(packet.Salt)
+
+			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, len(packet.Data))
+			s.logger.Trace("Plaintext data from %s: %x", clientAddr, packet.Data)
+
+			client.mu.Lock()
+			client.lastActive = time.Now()
+			client.countRecvBytes += uint32(len(packet.Data))
+			client.mu.Unlock()
+
+			_, err = s.tunnel.Write(packet.Data[8:])
+			if err != nil {
+				s.logger.Error("Write error to TUN interface for %s: %v", clientAddr, err)
+			}
+
+			s.logger.Debug("Client %s stats updated - received: %d bytes, total packets: %d",
+				clientAddr, client.countRecvBytes, client.countRecv)
+			s.logger.Debug("______________________________________________________________________________")
+		}
+	}
 }
 
 func (s *Server) cleanupIdleClients() {
@@ -193,63 +259,6 @@ func (s *Server) cleanupIdleClients() {
 			} else {
 				s.logger.Debug("No idle clients found")
 			}
-		}
-	}
-}
-
-func (s *Server) handleClient(client *Client) {
-	defer client.conn.Close()
-	clientAddr := client.addr
-	s.logger.Info("Starting client handler for %s", clientAddr)
-
-	for {
-		select {
-		case <-s.stopCh:
-			s.logger.Info("Client handler for %s stopped by server shutdown", clientAddr)
-			return
-		default:
-			lenRawPacketBytes := make([]byte, 2)
-			n, err := client.conn.Read(lenRawPacketBytes)
-			if err != nil {
-				s.logger.Error("Socket read error from %s: %v", clientAddr, err)
-				return
-			}
-
-			lenRawPacketBytes[0] = lenRawPacketBytes[0] ^ client.sessionKey[0]
-			lenRawPacketBytes[1] = lenRawPacketBytes[1] ^ client.sessionKey[1]
-			lenRawPacket := binary.BigEndian.Uint16(lenRawPacketBytes)
-
-			encrypted := make([]byte, lenRawPacket-2)
-			s.logger.Trace("Reading encrypted data from %s", clientAddr)
-			n, err = client.conn.Read(encrypted)
-			if err != nil {
-				s.logger.Error("Socket read error from %s: %v", clientAddr, err)
-				return
-			}
-
-			s.logger.Debug("Received packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, n)
-
-			packet := NewEncryptedPacket(encrypted, s.logger)
-			err = packet.Decrypt(client.sessionKey, n, clientAddr)
-			if err != nil {
-				s.logger.Error("Error processing the packet: %v", err)
-				continue
-			}
-
-			client.countRecv++
-			client.computeNextSessionKey(packet.Salt)
-
-			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, len(packet.Data))
-			s.logger.Trace("Plaintext data from %s: %x", clientAddr, packet.Data)
-
-			client.mu.Lock()
-			client.lastActive = time.Now()
-			client.countRecvBytes += uint32(len(packet.Data))
-			client.mu.Unlock()
-
-			s.logger.Debug("Client %s stats updated - received: %d bytes, total packets: %d",
-				clientAddr, client.countRecvBytes, client.countRecv)
-			s.logger.Debug("______________________________________________________________________________")
 		}
 	}
 }

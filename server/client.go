@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"net"
 	"smiletun-server/crypto"
 	"smiletun-server/logger"
@@ -23,6 +24,7 @@ type Client struct {
 	lastActive      time.Time
 	logger          *logger.Logger
 	maxPacketLength uint16
+	localIP         *net.IP
 	mu              sync.RWMutex
 }
 
@@ -75,4 +77,36 @@ func (c *Client) WriteAndEncryptPacket(packet []byte, minTrashficationLength int
 	}
 
 	return nil
+}
+
+func (c *Client) ReadAndDecryptStreamingPacket() (packet *StreamingPacket, err error) {
+	lenRawPacketBytes := make([]byte, 2)
+	n, err := c.conn.Read(lenRawPacketBytes)
+	if err != nil {
+		c.logger.Error("Socket read error from %s: %v", c.addr, err)
+		return nil, err
+	}
+
+	lenRawPacketBytes[0] = lenRawPacketBytes[0] ^ c.sessionKey[0]
+	lenRawPacketBytes[1] = lenRawPacketBytes[1] ^ c.sessionKey[1]
+	lenRawPacket := binary.BigEndian.Uint16(lenRawPacketBytes)
+
+	encrypted := make([]byte, lenRawPacket-2)
+	c.logger.Trace("Reading encrypted data from %s", c.addr)
+	n, err = c.conn.Read(encrypted)
+	if err != nil {
+		c.logger.Error("Socket read error from %s: %v", c.addr, err)
+		return nil, err
+	}
+
+	c.logger.Debug("Received packet #%d from %s (size: %d bytes)", c.countRecv, c.addr, n)
+
+	packet = NewEncryptedPacket(encrypted, c.logger)
+	err = packet.Decrypt(c.sessionKey, n, c.addr)
+	if err != nil {
+		c.logger.Error("Error processing the packet: %v", err)
+		return nil, err
+	}
+
+	return packet, nil
 }

@@ -76,7 +76,7 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 	return nil
 }
 
-func (c *Client) handshakeStage2(clientIP net.IP) (err error) {
+func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 	clientAddr := c.conn.RemoteAddr().String()
 
 	packet, err := c.ReadAndDecryptPacketFixedLength(ThirdPacketSize)
@@ -97,6 +97,8 @@ func (c *Client) handshakeStage2(clientIP net.IP) (err error) {
 		c.conn.Close()
 		return err
 	}
+
+	c.localIP = clientIP
 
 	return nil
 }
