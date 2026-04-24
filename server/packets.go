@@ -8,7 +8,7 @@ import (
 	"smiletun-server/logger"
 )
 
-type Packet struct {
+type StreamingPacket struct {
 	SourceAddress      *net.IP
 	DestinationAddress *net.IP
 	Salt               []byte
@@ -17,15 +17,15 @@ type Packet struct {
 	logger             *logger.Logger
 }
 
-func NewEncryptedPacket(EncryptedData []byte, logger *logger.Logger) (packet *Packet) {
-	return &Packet{
+func NewEncryptedPacket(EncryptedData []byte, logger *logger.Logger) (packet *StreamingPacket) {
+	return &StreamingPacket{
 		Data:          []byte{},
 		EncryptedData: EncryptedData,
 		logger:        logger,
 	}
 }
 
-func (p *Packet) Decrypt(sessionKey []byte, totalLength int, clientAddr string) (err error) {
+func (p *StreamingPacket) Decrypt(sessionKey []byte, totalLength int, clientAddr string) (err error) {
 	lenCipherPacketBytes := p.EncryptedData[0:2]
 	p.logger.Trace("Length bytes from %s: %x", clientAddr, lenCipherPacketBytes)
 
@@ -35,7 +35,7 @@ func (p *Packet) Decrypt(sessionKey []byte, totalLength int, clientAddr string) 
 	lenPacket := binary.BigEndian.Uint16(lenCipherPacketBytes)
 	p.logger.Debug("Packet length from %s: %d bytes", clientAddr, lenPacket)
 	if lenPacket > uint16(totalLength) {
-		return fmt.Errorf("error: The length of the encrypted data data exceeds the total length")
+		return fmt.Errorf("error: The length of the encrypted data exceeds the total length")
 	}
 
 	cipherPacket := p.EncryptedData[2:lenPacket]
