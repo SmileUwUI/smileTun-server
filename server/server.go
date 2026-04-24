@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -11,30 +10,6 @@ import (
 	"sync"
 	"time"
 )
-
-type Client struct {
-	addr           string
-	conn           *net.TCPConn
-	user           *users.User
-	countRecv      uint32
-	countSent      uint32
-	countRecvBytes uint32
-	countSentBytes uint32
-	sessionKey     []byte
-	createdAt      time.Time
-	lastActive     time.Time
-	logger         *logger.Logger
-	mu             sync.RWMutex
-}
-
-func (c *Client) computeNextSessionKey(salt []byte) {
-	hasher := sha256.New()
-	hasher.Write(c.sessionKey)
-	hasher.Write([]byte(":"))
-	hasher.Write(salt)
-
-	c.sessionKey = hasher.Sum(nil)
-}
 
 type Server struct {
 	config      *config.Config
@@ -149,16 +124,17 @@ func (s *Server) handleConnection(conn net.Conn) {
 	now := time.Now()
 
 	client := &Client{
-		addr:           conn.RemoteAddr().String(),
-		conn:           connTCP,
-		countRecv:      0,
-		countSent:      0,
-		countRecvBytes: 0,
-		countSentBytes: 0,
-		sessionKey:     []byte{},
-		createdAt:      now,
-		lastActive:     now,
-		logger:         s.logger,
+		addr:            conn.RemoteAddr().String(),
+		conn:            connTCP,
+		countRecv:       0,
+		countSent:       0,
+		countRecvBytes:  0,
+		countSentBytes:  0,
+		sessionKey:      []byte{},
+		createdAt:       now,
+		lastActive:      now,
+		logger:          s.logger,
+		maxPacketLength: 4096,
 	}
 
 	err := client.handshakeStage1(s.config.InitPassword, s.users)
