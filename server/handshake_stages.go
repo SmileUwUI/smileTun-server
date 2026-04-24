@@ -25,7 +25,7 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 	c.logger.Debug("Reading first packet from %s (size: %d bytes)", clientAddr, FirstPacketSize)
 	firstPacket, err := c.ReadAndDecryptPacketFixedLength(uint16(FirstPacketSize))
 	if err != nil {
-		c.logger.Error("Failed to read and decrypt packet from %s: %v", clientAddr, err)
+		c.logger.Error("Failed to read and decrypt first packet from %s: %v", clientAddr, err)
 		c.conn.Close()
 		return err
 	}
@@ -55,6 +55,11 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 
 	salt := crypto.RandomBytes(32)
 	err = c.WriteAndEncryptPacket(salt, 400, 1300)
+	if err != nil {
+		c.logger.Error("Failed to encrypt and write packet from %s: %v", clientAddr, err)
+		c.conn.Close()
+		return err
+	}
 
 	c.logger.Debug("Salt packet sent to %s", clientAddr)
 
@@ -74,42 +79,21 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 func (c *Client) handshakeStage2(clientIP net.IP) (err error) {
 	clientAddr := c.conn.RemoteAddr().String()
 
-	thirdPacket := make([]byte, 4096)
-	if _, err = c.conn.Read(thirdPacket); err != nil {
-		c.logger.Error("Failed to read third packet from %s: %v", clientAddr, err)
-		c.conn.Close()
-		return err
-	}
-
-	packet := thirdPacket[:ThirdPacketSize]
-	plainPacket, err := crypto.DecryptChaCha20Poly1305(packet[12:], packet[:12], c.sessionKey)
+	packet, err := c.ReadAndDecryptPacketFixedLength(ThirdPacketSize)
 	if err != nil {
-		c.logger.Error("Failed to decrypt first packet from %s: %v", clientAddr, err)
+		c.logger.Error("Failed to read and decrypt third packet from %s: %v", clientAddr, err)
 		c.conn.Close()
 		return err
 	}
 
-	if plainPacket[0] != 0xFF {
+	if packet[0] != 0xFF {
 		c.conn.Close()
 		return fmt.Errorf("The client rejected the connection (addr: %s)", clientAddr)
 	}
 
-	plainIPPacket := make([]byte, 4)
-	copy(plainIPPacket[:4], clientIP.To4())
-
-	ciphetIPPacket, nonce, err := crypto.EncryptChaCha20Poly1305(plainIPPacket, c.sessionKey)
+	err = c.WriteAndEncryptPacket(clientIP.To4(), 400, 1300)
 	if err != nil {
-		c.logger.Error("Failed to encrypt ip for %s: %v", clientAddr, err)
-		c.conn.Close()
-		return
-	}
-
-	finallyPacket := make([]byte, len(ciphetIPPacket)+len(nonce))
-	copy(finallyPacket[:12], nonce)
-	copy(finallyPacket[12:], ciphetIPPacket)
-
-	if _, err = c.conn.Write(finallyPacket); err != nil {
-		c.logger.Error("Failed to send salt to %s: %v", clientAddr, err)
+		c.logger.Error("Failed to encrypt and write packet from %s: %v", clientAddr, err)
 		c.conn.Close()
 		return err
 	}
