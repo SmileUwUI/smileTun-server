@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"smiletun-server/crypto"
 	"smiletun-server/logger"
@@ -19,7 +20,8 @@ type Client struct {
 	countSent       uint32
 	countRecvBytes  uint32
 	countSentBytes  uint32
-	sessionKey      []byte
+	sessionSentKey  []byte
+	sessionRecvKey  []byte
 	createdAt       time.Time
 	lastActive      time.Time
 	logger          *logger.Logger
@@ -28,13 +30,13 @@ type Client struct {
 	mu              sync.RWMutex
 }
 
-func (c *Client) computeNextSessionKey(salt []byte) {
+func (c *Client) computeNextSessionRecvKey(salt []byte) {
 	hasher := sha256.New()
-	hasher.Write(c.sessionKey)
+	hasher.Write(c.sessionRecvKey)
 	hasher.Write([]byte(":"))
 	hasher.Write(salt)
 
-	c.sessionKey = hasher.Sum(nil)
+	c.sessionRecvKey = hasher.Sum(nil)
 }
 
 func (c *Client) ReadAndDecryptPacketFixedLength(length uint16) (packet []byte, err error) {
@@ -46,7 +48,7 @@ func (c *Client) ReadAndDecryptPacketFixedLength(length uint16) (packet []byte, 
 	}
 
 	cipherPacket := rawPacket[:length]
-	plainPacket, err := crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], c.sessionKey)
+	plainPacket, err := crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], c.sessionRecvKey)
 	if err != nil {
 		c.logger.Error("Failed to decrypt packet from %s: %v", c.addr, err)
 		c.conn.Close()
@@ -57,12 +59,13 @@ func (c *Client) ReadAndDecryptPacketFixedLength(length uint16) (packet []byte, 
 }
 
 func (c *Client) WriteAndEncryptPacket(packet []byte, minTrashficationLength int, maxTrashficationLength int) (err error) {
-	rawPacket, nonce, err := crypto.EncryptChaCha20Poly1305(packet, c.sessionKey)
+	rawPacket, nonce, err := crypto.EncryptChaCha20Poly1305(packet, c.sessionSentKey)
 	if err != nil {
 		c.logger.Error("Failed to encrypt packet for %s: %v", c.addr, err)
 		c.conn.Close()
 		return err
 	}
+	fmt.Println(c.sessionSentKey)
 
 	packet = make([]byte, len(rawPacket)+len(nonce))
 	copy(packet[:12], nonce)
@@ -87,8 +90,8 @@ func (c *Client) ReadAndDecryptStreamingPacket() (packet *StreamingPacket, err e
 		return nil, err
 	}
 
-	lenRawPacketBytes[0] = lenRawPacketBytes[0] ^ c.sessionKey[0]
-	lenRawPacketBytes[1] = lenRawPacketBytes[1] ^ c.sessionKey[1]
+	lenRawPacketBytes[0] = lenRawPacketBytes[0] ^ c.sessionRecvKey[0]
+	lenRawPacketBytes[1] = lenRawPacketBytes[1] ^ c.sessionRecvKey[1]
 	lenRawPacket := binary.BigEndian.Uint16(lenRawPacketBytes)
 
 	encrypted := make([]byte, lenRawPacket-2)
@@ -102,7 +105,7 @@ func (c *Client) ReadAndDecryptStreamingPacket() (packet *StreamingPacket, err e
 	c.logger.Debug("Received packet #%d from %s (size: %d bytes)", c.countRecv, c.addr, n)
 
 	packet = NewEncryptedPacket(encrypted, c.logger)
-	err = packet.Decrypt(c.sessionKey, n, c.addr)
+	err = packet.Decrypt(c.sessionRecvKey, n, c.addr)
 	if err != nil {
 		c.logger.Error("Error processing the packet: %v", err)
 		return nil, err

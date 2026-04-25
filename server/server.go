@@ -55,6 +55,27 @@ func (s *Server) Start() error {
 	s.listener = listener
 	s.logger.Info("TCP proxy server listening on %s", addr)
 
+	s.tunnel, err = NewTunnel(
+		"tun0",
+		1500,
+		net.ParseIP("10.8.83.1"),
+		net.IPv4Mask(255, 255, 255, 0),
+		[]*net.IPNet{
+			{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
+		},
+	)
+
+	if err != nil {
+		s.logger.Error("Failed to create tunnel: %v", err)
+		return err
+	}
+
+	err = s.tunnel.Up()
+	if err != nil {
+		s.logger.Error("Failed to up tunnel: %v", err)
+		return err
+	}
+
 	s.logger.Debug("Starting accept connections goroutine")
 	go s.acceptConnections()
 
@@ -103,27 +124,6 @@ func (s *Server) acceptConnections() {
 			s.incrementClientCount()
 			s.logger.Debug("Starting handle connection goroutine for %s", conn.RemoteAddr())
 
-			s.tunnel, err = NewTunnel(
-				"tun0",
-				1500,
-				net.ParseIP("10.8.83.1"),
-				net.IPv4Mask(255, 255, 255, 0),
-				[]*net.IPNet{
-					{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
-				},
-			)
-
-			if err != nil {
-				s.logger.Error("Failed to create tunnel: %v", err)
-				return
-			}
-
-			err = s.tunnel.Up()
-			if err != nil {
-				s.logger.Error("Failed to up tunnel: %v", err)
-				return
-			}
-
 			go s.handleConnection(conn)
 		}
 	}
@@ -152,7 +152,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		countSent:       0,
 		countRecvBytes:  0,
 		countSentBytes:  0,
-		sessionKey:      []byte{},
+		sessionRecvKey:  []byte{},
+		sessionSentKey:  []byte{},
 		createdAt:       now,
 		lastActive:      now,
 		logger:          s.logger,
@@ -206,7 +207,7 @@ func (s *Server) handleClient(client *Client) {
 			}
 
 			client.countRecv++
-			client.computeNextSessionKey(packet.Salt)
+			client.computeNextSessionRecvKey(packet.Salt)
 
 			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, len(packet.Data))
 			s.logger.Trace("Plaintext data from %s: %x", clientAddr, packet.Data)

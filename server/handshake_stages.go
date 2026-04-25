@@ -17,7 +17,8 @@ const ThirdPacketSize = chacha20poly1305.NonceSize + 1 + chacha20poly1305.Overhe
 
 func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err error) {
 	clientAddr := c.conn.RemoteAddr().String()
-	c.sessionKey = initPassword[:]
+	c.sessionSentKey = initPassword[:]
+	c.sessionRecvKey = initPassword[:]
 
 	c.logger.Debug("Setting read deadline to 15 seconds for %s", clientAddr)
 	c.conn.SetDeadline(time.Now().Add(15 * time.Second))
@@ -60,17 +61,27 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 		c.conn.Close()
 		return err
 	}
+	fmt.Println(salt)
 
 	c.logger.Debug("Salt packet sent to %s", clientAddr)
 
 	c.logger.Debug("Deriving session key for %s", clientAddr)
-	sessionKeyHasher := sha256.New()
+
+	sessionRecvKeyHasher := sha256.New()
 	password := user.GetPassword()
 
-	sessionKeyHasher.Write(password[:])
-	sessionKeyHasher.Write([]byte(":"))
-	sessionKeyHasher.Write(salt)
-	c.sessionKey = sessionKeyHasher.Sum(nil)
+	sessionRecvKeyHasher.Write(password[:])
+	sessionRecvKeyHasher.Write([]byte(":"))
+	sessionRecvKeyHasher.Write(salt[0:16])
+	c.sessionRecvKey = sessionRecvKeyHasher.Sum(nil)
+
+	sessionSentKeyHasher := sha256.New()
+
+	sessionSentKeyHasher.Write(password[:])
+	sessionSentKeyHasher.Write([]byte(":"))
+	sessionSentKeyHasher.Write(salt[16:32])
+	c.sessionSentKey = sessionSentKeyHasher.Sum(nil)
+
 	c.logger.Debug("Session key derived for %s", clientAddr)
 
 	return nil
