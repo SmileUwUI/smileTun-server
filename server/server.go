@@ -186,11 +186,17 @@ func (s *Server) tunnelReader() {
 			continue
 		}
 
-		salt := crypto.RandomBytes(8)
+		salt, err := crypto.RandomBytes(8)
+		if err != nil {
+			s.logger.Error("salt generation error: %v", err)
+			return
+		}
 
 		packet := NewPlainPacket()
 		packet.AddData(rawPacket)
 		packet.PackageAssembly(client.sessionSentKey, salt)
+
+		s.logger.Trace("Sent #%d %d", client.countSent, len(packet.GetRawData()))
 
 		_, err = client.conn.Write(packet.GetRawData())
 		if err != nil {

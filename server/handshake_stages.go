@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -46,7 +48,12 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 		return fmt.Errorf("user not found (username: %x)", username)
 	}
 
-	salt := crypto.RandomBytes(32)
+	salt, err := crypto.RandomBytes(32)
+	if err != nil {
+		c.logger.Error("salt generation error: %v", err)
+		return err
+	}
+
 	saltPacket := NewPlainPacket()
 	saltPacket.AddData(salt)
 	saltPacket.PackageAssembly(initPassword[:], []byte{})
@@ -95,9 +102,27 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 		c.conn.Close()
 		return fmt.Errorf("the client rejected the connection")
 	}
+	curve := ecdh.P256()
+
+	c.logger.Debug("Parsing the client's public key")
+	publicClientKey, err := curve.NewPublicKey(packet.GetPlainData()[1:])
+	if err != nil {
+		c.logger.Error("Error parsing the client's public key: %v", err)
+		return err
+	}
+
+	c.logger.Debug("Generating a keypair for ECDH")
+	privateServerKey, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		c.logger.Error("Error generating the keypair")
+		return err
+	}
+
+	publicServerKey := privateServerKey.PublicKey()
 
 	ipPacket := NewPlainPacket()
 	ipPacket.AddData(clientIP.To4())
+	ipPacket.AddData(publicServerKey.Bytes())
 	ipPacket.PackageAssembly(c.sessionSentKey, []byte{})
 
 	if _, err = c.conn.Write(ipPacket.GetRawData()); err != nil {
@@ -107,6 +132,16 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 	}
 
 	c.localIP = clientIP
+
+	c.logger.Debug("Conducting the ECDH")
+
+	secret, err := privateServerKey.ECDH(publicClientKey)
+	if err != nil {
+		c.logger.Error("ECDH execution error: %v", err)
+		return err
+	}
+	c.computeNextSessionRecvKey(secret)
+	c.computeNextSessionSentKey(secret)
 
 	return nil
 }
