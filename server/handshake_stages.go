@@ -56,7 +56,7 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 
 	saltPacket := NewPlainPacket()
 	saltPacket.AddData(salt)
-	saltPacket.PackageAssembly(initPassword[:], []byte{})
+	saltPacket.PackageAssembly(initPassword[:], []byte{}, false, false)
 
 	if _, err = c.conn.Write(saltPacket.GetRawData()); err != nil {
 		c.logger.Error("%v", err)
@@ -123,7 +123,7 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 	ipPacket := NewPlainPacket()
 	ipPacket.AddData(clientIP.To4())
 	ipPacket.AddData(publicServerKey.Bytes())
-	ipPacket.PackageAssembly(c.sessionSentKey, []byte{})
+	ipPacket.PackageAssembly(c.sessionSentKey, []byte{}, false, false)
 
 	if _, err = c.conn.Write(ipPacket.GetRawData()); err != nil {
 		c.logger.Error("%v", err)
@@ -134,7 +134,6 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 	c.localIP = clientIP
 
 	c.logger.Debug("Conducting the ECDH")
-
 	secret, err := privateServerKey.ECDH(publicClientKey)
 	if err != nil {
 		c.logger.Error("ECDH execution error: %v", err)

@@ -19,6 +19,8 @@ type StreamingPacket struct {
 	rawData    []byte
 	plainData  []byte
 	cipherData []byte
+	fakeFlag   bool
+	ecdhFlag   bool
 	typePacket TypePacket
 }
 
@@ -49,11 +51,13 @@ func (s *StreamingPacket) AddData(data []byte) error {
 	return nil
 }
 
-func (s *StreamingPacket) PackageAssembly(key, salt []byte) (err error) {
+func (s *StreamingPacket) PackageAssembly(key, salt []byte, fake, ecdh bool) (err error) {
 	if s.typePacket != PlainPacket {
 		return errors.New("this operation is available only for the PlainPacket package type")
 	}
 
+	s.fakeFlag = fake
+	s.ecdhFlag = ecdh
 	s.salt = salt
 	var nonce []byte
 	plainDataWithSalt := make([]byte, len(s.plainData)+len(salt))
@@ -65,20 +69,30 @@ func (s *StreamingPacket) PackageAssembly(key, salt []byte) (err error) {
 		return fmt.Errorf("packet decryption error: %v", err)
 	}
 
-	s.rawData = make([]byte, len(s.cipherData)+len(nonce)+2+2) // size CipherData + size Nonce + size length RawData + size length CipherData
+	s.rawData = make([]byte, len(s.cipherData)+len(nonce)+2+2+1) // size CipherData + size Nonce + size length RawData + size length CipherData + size flags byte
 
-	binary.BigEndian.PutUint16(s.rawData[2:4], uint16(len(s.cipherData)+len(nonce)+2))
-	copy(s.rawData[4:16], nonce)
-	copy(s.rawData[16:], s.cipherData)
+	binary.BigEndian.PutUint16(s.rawData[3:5], uint16(len(s.cipherData)+len(nonce)+2))
+	copy(s.rawData[5:17], nonce)
+	copy(s.rawData[17:], s.cipherData)
 
 	s.rawData = crypto.Trashfication(s.rawData, 300, 1500)
 
 	binary.BigEndian.PutUint16(s.rawData[:2], uint16(len(s.rawData)))
 
+	flagsBytes, err := crypto.RandomBytes(1)
+	flags := flagsBytes[0] & 0b11111100
+	if s.fakeFlag {
+		flags = flags | 0b00000001
+	}
+	if s.ecdhFlag {
+		flags = flags | 0b00000010
+	}
+
 	s.rawData[0] = s.rawData[0] ^ key[0]
 	s.rawData[1] = s.rawData[1] ^ key[1]
-	s.rawData[2] = s.rawData[2] ^ key[2]
+	s.rawData[2] = flags ^ key[2]
 	s.rawData[3] = s.rawData[3] ^ key[3]
+	s.rawData[4] = s.rawData[4] ^ key[4]
 
 	return nil
 }
@@ -88,12 +102,19 @@ func (s *StreamingPacket) DecodeAndDecrypt(key []byte, withSalt bool) (err error
 		return errors.New("this operation is available only for the RawPacket package type")
 	}
 
-	lengthCipherDataBytes := s.rawData[2:4]
-	lengthCipherDataBytes[0] = lengthCipherDataBytes[0] ^ key[2]
-	lengthCipherDataBytes[1] = lengthCipherDataBytes[1] ^ key[3]
+	lengthCipherDataBytes := s.rawData[3:5]
+	flags := s.rawData[2] ^ key[2]
+	lengthCipherDataBytes[0] = lengthCipherDataBytes[0] ^ key[3]
+	lengthCipherDataBytes[1] = lengthCipherDataBytes[1] ^ key[4]
+
+	s.ecdhFlag = (flags>>1)&1 == 1
+	s.fakeFlag = flags&1 == 1
+	if s.fakeFlag {
+		return nil
+	}
 
 	lengthCipherData := binary.BigEndian.Uint16(lengthCipherDataBytes)
-	s.cipherData = s.rawData[4 : lengthCipherData+2]
+	s.cipherData = s.rawData[5 : lengthCipherData+2]
 
 	s.plainData, err = crypto.DecryptChaCha20Poly1305(s.cipherData[12:], s.cipherData[:12], key)
 	if err != nil {

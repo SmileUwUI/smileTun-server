@@ -194,7 +194,7 @@ func (s *Server) tunnelReader() {
 
 		packet := NewPlainPacket()
 		packet.AddData(rawPacket)
-		packet.PackageAssembly(client.sessionSentKey, salt)
+		packet.PackageAssembly(client.sessionSentKey, salt, false, false)
 
 		s.logger.Trace("Sent #%d %d", client.countSent, len(packet.GetRawData()))
 
