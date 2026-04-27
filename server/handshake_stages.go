@@ -68,7 +68,7 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 
 	saltPacket := NewPlainPacket()
 	saltPacket.AddData(salt)
-	err = saltPacket.PackageAssembly(initPassword[:], []byte{}, false, false)
+	err = saltPacket.PackageAssembly(initPassword[:], []byte{}, []byte{}, false, false)
 	if err != nil {
 		c.logger.Error("Error assembly a salt packet: %v", err)
 		c.conn.Close()
@@ -143,7 +143,7 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 		return err
 	}
 
-	curve := ecdh.P256()
+	curve := ecdh.X25519()
 
 	c.logger.Debug("Parsing the client's public key")
 	publicClientKey, err := curve.NewPublicKey(publicClientKeyBytes)
@@ -164,7 +164,7 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 	ipPacket := NewPlainPacket()
 	ipPacket.AddData(clientIP.To4())
 	ipPacket.AddData(publicServerKey.Bytes())
-	err = ipPacket.PackageAssembly(c.sessionSentKey, []byte{}, false, false)
+	err = ipPacket.PackageAssembly(c.sessionSentKey, []byte{}, []byte{}, false, false)
 	if err != nil {
 		c.logger.Error("Error assembly a ip packet: %v", err)
 		c.conn.Close()
