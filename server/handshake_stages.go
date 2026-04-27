@@ -31,7 +31,14 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 		return err
 	}
 
-	timestamp := int64(binary.BigEndian.Uint64(usernamePacket.GetPlainData()[16:24]))
+	timestampBytes, err := usernamePacket.GetSlicePlainData(16, 24)
+	if err != nil {
+		c.logger.Error("Error retrieving the timestamp")
+		c.conn.Close()
+		return err
+	}
+
+	timestamp := int64(binary.BigEndian.Uint64(timestampBytes))
 	currentTime := time.Now().Unix()
 	timeDiff := currentTime - timestamp
 
@@ -40,7 +47,12 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 		return fmt.Errorf("invalid timestamp")
 	}
 
-	username := usernamePacket.GetPlainData()[:16]
+	username, err := usernamePacket.GetSlicePlainData(0, 16)
+	if err != nil {
+		c.logger.Error("Error retrieving the username")
+		c.conn.Close()
+		return err
+	}
 
 	user := users.GetUser([16]byte(username))
 	if user == nil {
@@ -56,7 +68,12 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 
 	saltPacket := NewPlainPacket()
 	saltPacket.AddData(salt)
-	saltPacket.PackageAssembly(initPassword[:], []byte{}, false, false)
+	err = saltPacket.PackageAssembly(initPassword[:], []byte{}, false, false)
+	if err != nil {
+		c.logger.Error("Error assembly a salt packet: %v", err)
+		c.conn.Close()
+		return err
+	}
 
 	if _, err = c.conn.Write(saltPacket.GetRawData()); err != nil {
 		c.logger.Error("%v", err)
@@ -66,46 +83,70 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 
 	sessionRecvKeyHasher := sha256.New()
 	password := user.GetPassword()
-
+	firstSalt, err := saltPacket.GetSlicePlainData(0, 16)
+	if err != nil {
+		c.logger.Error("Error retrieving the first salt: %v", err)
+		c.conn.Close()
+		return err
+	}
 	sessionRecvKeyHasher.Write(password[:])
 	sessionRecvKeyHasher.Write([]byte(":"))
-	sessionRecvKeyHasher.Write(salt[0:16])
+	sessionRecvKeyHasher.Write(firstSalt)
 	c.sessionRecvKey = sessionRecvKeyHasher.Sum(nil)
 
 	sessionSentKeyHasher := sha256.New()
-
+	secondSalt, err := saltPacket.GetSlicePlainData(16, 32)
+	if err != nil {
+		c.logger.Error("Error retrieving the second salt: %v", err)
+		c.conn.Close()
+		return err
+	}
 	sessionSentKeyHasher.Write(password[:])
 	sessionSentKeyHasher.Write([]byte(":"))
-	sessionSentKeyHasher.Write(salt[16:32])
+	sessionSentKeyHasher.Write(secondSalt)
 	c.sessionSentKey = sessionSentKeyHasher.Sum(nil)
 
 	return nil
 }
 
 func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
-
 	packet, err := c.readPacket()
 	if err != nil {
-		c.logger.Error("%v", err)
+		c.logger.Error("Error reading the packet containing the connection establishment confirmation and the client's public key: %v", err)
 		c.conn.Close()
 		return err
 	}
 
 	err = packet.DecodeAndDecrypt(c.sessionRecvKey, false)
 	if err != nil {
-		c.logger.Error("%v", err)
+		c.logger.Error("Decoding and decryption error for the packet containing the connection establishment acknowledgment and the client's public key: %v", err)
 		c.conn.Close()
 		return err
 	}
 
-	if packet.GetPlainData()[0] != 0xFF {
+	confirmationByte, err := packet.GetSlicePlainData(0, 1)
+	if err != nil {
+		c.logger.Error("Error retrieving the second salt: %v", err)
+		c.conn.Close()
+		return err
+	}
+
+	if confirmationByte[0] != 0xFF {
 		c.conn.Close()
 		return fmt.Errorf("the client rejected the connection")
 	}
+
+	publicClientKeyBytes, err := packet.GetSlicePlainData(1, packet.GetSizePlainData())
+	if err != nil {
+		c.logger.Error("Error retrieving the second salt: %v", err)
+		c.conn.Close()
+		return err
+	}
+
 	curve := ecdh.P256()
 
 	c.logger.Debug("Parsing the client's public key")
-	publicClientKey, err := curve.NewPublicKey(packet.GetPlainData()[1:])
+	publicClientKey, err := curve.NewPublicKey(publicClientKeyBytes)
 	if err != nil {
 		c.logger.Error("Error parsing the client's public key: %v", err)
 		return err
@@ -123,7 +164,12 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 	ipPacket := NewPlainPacket()
 	ipPacket.AddData(clientIP.To4())
 	ipPacket.AddData(publicServerKey.Bytes())
-	ipPacket.PackageAssembly(c.sessionSentKey, []byte{}, false, false)
+	err = ipPacket.PackageAssembly(c.sessionSentKey, []byte{}, false, false)
+	if err != nil {
+		c.logger.Error("Error assembly a ip packet: %v", err)
+		c.conn.Close()
+		return err
+	}
 
 	if _, err = c.conn.Write(ipPacket.GetRawData()); err != nil {
 		c.logger.Error("%v", err)

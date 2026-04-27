@@ -129,7 +129,7 @@ func (s *StreamingPacket) DecodeAndDecrypt(key []byte, withSalt bool) (err error
 	return nil
 }
 
-func (s *StreamingPacket) GetRawData() (data []byte) {
+func (s *StreamingPacket) GetRawData() (rawData []byte) {
 	return s.rawData
 }
 
@@ -137,10 +137,36 @@ func (s *StreamingPacket) GetSalt() (salt []byte) {
 	return s.salt
 }
 
-func (s *StreamingPacket) GetCipherData() (salt []byte) {
+func (s *StreamingPacket) GetCipherData() (cipherData []byte) {
 	return s.cipherData
 }
 
-func (s *StreamingPacket) GetPlainData() (salt []byte) {
+func (s *StreamingPacket) GetPlainData() (plainData []byte) {
 	return s.plainData
+}
+
+func (s *StreamingPacket) GetSizePlainData() (size int) {
+	return len(s.plainData)
+}
+
+func (s *StreamingPacket) GetSlicePlainData(start, end int) (slicePlainData []byte, err error) {
+	if start > end {
+		return nil, errors.New("the start index cannot be greater than the end index")
+	}
+
+	if len(s.plainData) == 0 {
+		return nil, errors.New("The size of `plainData` cannot be 0")
+	}
+
+	if start < 0 {
+		return nil, errors.New("the starting index cannot be less than 0")
+	}
+
+	if end > len(s.plainData) {
+		return nil, errors.New("the end index cannot exceed the packet length")
+	}
+
+	slicePlainData = s.plainData
+
+	return slicePlainData[start:end], nil
 }

@@ -85,7 +85,6 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) acceptConnections() {
-
 	for {
 		select {
 		case <-s.stopCh:
@@ -176,6 +175,9 @@ func (s *Server) tunnelReader() {
 			continue
 		}
 		rawPacket = rawPacket[:n]
+		if n < 20 {
+			continue
+		}
 
 		dstIP := rawPacket[16:20]
 
@@ -188,15 +190,17 @@ func (s *Server) tunnelReader() {
 
 		salt, err := crypto.RandomBytes(8)
 		if err != nil {
-			s.logger.Error("salt generation error: %v", err)
-			return
+			s.logger.Error("Salt generation error: %v", err)
+			continue
 		}
 
 		packet := NewPlainPacket()
 		packet.AddData(rawPacket)
-		packet.PackageAssembly(client.sessionSentKey, salt, false, false)
-
-		s.logger.Trace("Sent #%d %d", client.countSent, len(packet.GetRawData()))
+		err = packet.PackageAssembly(client.sessionSentKey, salt, false, false)
+		if err != nil {
+			s.logger.Error("Error assembly a packet: %v", err)
+			continue
+		}
 
 		_, err = client.conn.Write(packet.GetRawData())
 		if err != nil {
