@@ -3,9 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"fmt"
 	"net"
-	"smiletun-server/crypto"
 	"smiletun-server/logger"
 	"smiletun-server/users"
 	"sync"
@@ -39,77 +37,54 @@ func (c *Client) computeNextSessionRecvKey(salt []byte) {
 	c.sessionRecvKey = hasher.Sum(nil)
 }
 
-func (c *Client) ReadAndDecryptPacketFixedLength(length uint16) (packet []byte, err error) {
-	rawPacket := make([]byte, c.maxPacketLength)
-	if _, err = c.conn.Read(rawPacket); err != nil {
-		c.logger.Error("Failed to read packet from %s: %v", c.addr, err)
-		c.conn.Close()
-		return nil, err
-	}
+func (c *Client) computeNextSessionSentKey(salt []byte) {
+	hasher := sha256.New()
+	hasher.Write(c.sessionSentKey)
+	hasher.Write([]byte(":"))
+	hasher.Write(salt)
 
-	cipherPacket := rawPacket[:length]
-	plainPacket, err := crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], c.sessionRecvKey)
-	if err != nil {
-		c.logger.Error("Failed to decrypt packet from %s: %v", c.addr, err)
-		c.conn.Close()
-		return nil, err
-	}
-
-	return plainPacket, nil
+	c.sessionSentKey = hasher.Sum(nil)
 }
 
-func (c *Client) WriteAndEncryptPacket(packet []byte, minTrashficationLength int, maxTrashficationLength int) (err error) {
-	rawPacket, nonce, err := crypto.EncryptChaCha20Poly1305(packet, c.sessionSentKey)
+func (c *Client) readPacket() (packet *StreamingPacket, err error) {
+	lenPacketBytes, err := c.read(2)
 	if err != nil {
-		c.logger.Error("Failed to encrypt packet for %s: %v", c.addr, err)
-		c.conn.Close()
-		return err
-	}
-	fmt.Println(c.sessionSentKey)
-
-	packet = make([]byte, len(rawPacket)+len(nonce))
-	copy(packet[:12], nonce)
-	copy(packet[12:], rawPacket)
-
-	trashPacket := crypto.Trashfication(packet, minTrashficationLength, maxTrashficationLength)
-
-	if _, err = c.conn.Write(trashPacket); err != nil {
-		c.logger.Error("Failed to send packet to %s: %v", c.addr, err)
-		c.conn.Close()
-		return err
-	}
-
-	return nil
-}
-
-func (c *Client) ReadAndDecryptStreamingPacket() (packet *StreamingPacket, err error) {
-	lenRawPacketBytes := make([]byte, 2)
-	n, err := c.conn.Read(lenRawPacketBytes)
-	if err != nil {
-		c.logger.Error("Socket read error from %s: %v", c.addr, err)
 		return nil, err
 	}
 
-	lenRawPacketBytes[0] = lenRawPacketBytes[0] ^ c.sessionRecvKey[0]
-	lenRawPacketBytes[1] = lenRawPacketBytes[1] ^ c.sessionRecvKey[1]
-	lenRawPacket := binary.BigEndian.Uint16(lenRawPacketBytes)
+	packet = NewRawPacket()
+	packet.AddData(lenPacketBytes)
 
-	encrypted := make([]byte, lenRawPacket-2)
-	c.logger.Trace("Reading encrypted data from %s", c.addr)
-	n, err = c.conn.Read(encrypted)
+	lenPacketBytes[0] = lenPacketBytes[0] ^ c.sessionRecvKey[0]
+	lenPacketBytes[1] = lenPacketBytes[1] ^ c.sessionRecvKey[1]
+	lenPacket := binary.BigEndian.Uint16(lenPacketBytes)
+
+	rawPacket, err := c.read(lenPacket - 2)
 	if err != nil {
-		c.logger.Error("Socket read error from %s: %v", c.addr, err)
 		return nil, err
 	}
-
-	c.logger.Debug("Received packet #%d from %s (size: %d bytes)", c.countRecv, c.addr, n)
-
-	packet = NewEncryptedPacket(encrypted, c.logger)
-	err = packet.Decrypt(c.sessionRecvKey, n, c.addr)
-	if err != nil {
-		c.logger.Error("Error processing the packet: %v", err)
-		return nil, err
-	}
+	packet.AddData(rawPacket)
 
 	return packet, nil
+}
+
+func (c *Client) read(length uint16) (data []byte, err error) {
+	if length == 0 {
+		return []byte{}, nil
+	}
+
+	data = make([]byte, length)
+	remaining := length
+	offset := 0
+
+	for remaining > 0 {
+		n, err := c.conn.Read(data[offset:])
+		if err != nil {
+			return nil, err
+		}
+		remaining -= uint16(n)
+		offset += n
+	}
+
+	return data, nil
 }

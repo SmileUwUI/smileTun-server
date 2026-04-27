@@ -2,58 +2,124 @@ package server
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"net"
 	"smiletun-server/crypto"
-	"smiletun-server/logger"
+)
+
+type TypePacket uint8
+
+const (
+	PlainPacket TypePacket = 0
+	RawPacket   TypePacket = 1
 )
 
 type StreamingPacket struct {
-	SourceAddress      *net.IP
-	DestinationAddress *net.IP
-	Salt               []byte
-	Data               []byte
-	EncryptedData      []byte
-	logger             *logger.Logger
+	salt       []byte
+	rawData    []byte
+	plainData  []byte
+	cipherData []byte
+	typePacket TypePacket
 }
 
-func NewEncryptedPacket(EncryptedData []byte, logger *logger.Logger) (packet *StreamingPacket) {
+func NewPlainPacket() (packet *StreamingPacket) {
 	return &StreamingPacket{
-		Data:          []byte{},
-		EncryptedData: EncryptedData,
-		logger:        logger,
+		typePacket: PlainPacket,
 	}
 }
 
-func (p *StreamingPacket) Decrypt(sessionKey []byte, totalLength int, clientAddr string) (err error) {
-	lenCipherPacketBytes := p.EncryptedData[0:2]
-	p.logger.Trace("Length bytes from %s: %x", clientAddr, lenCipherPacketBytes)
-
-	lenCipherPacketBytes[0] = lenCipherPacketBytes[0] ^ sessionKey[2]
-	lenCipherPacketBytes[1] = lenCipherPacketBytes[1] ^ sessionKey[3]
-
-	lenPacket := binary.BigEndian.Uint16(lenCipherPacketBytes)
-	p.logger.Debug("Packet length from %s: %d bytes", clientAddr, lenPacket)
-	if lenPacket > uint16(totalLength) {
-		return fmt.Errorf("error: The length of the encrypted data exceeds the total length")
+func NewRawPacket() (packet *StreamingPacket) {
+	return &StreamingPacket{
+		typePacket: RawPacket,
 	}
+}
 
-	cipherPacket := p.EncryptedData[2:lenPacket]
-	p.logger.Trace("Cipher packet from %s size: %d bytes", clientAddr, len(cipherPacket))
+func (s *StreamingPacket) AddData(data []byte) error {
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
 
-	p.logger.Trace("Decrypting packet from %s", clientAddr)
-	p.Data, err = crypto.DecryptChaCha20Poly1305(cipherPacket[12:], cipherPacket[:12], sessionKey)
-	if err != nil {
-		return err
+	if s.typePacket == PlainPacket {
+		s.plainData = append(s.plainData, dataCopy...)
+	} else if s.typePacket == RawPacket {
+		s.rawData = append(s.rawData, dataCopy...)
+	} else {
+		return errors.New("unknown packet type")
 	}
-
-	if len(p.Data) <= 8 {
-		return fmt.Errorf("the length of the decrypted packet is too short")
-	}
-
-	p.Salt = p.Data[0:8]
-
-	p.logger.Debug("Recalculation of the session key for address %s", clientAddr)
 
 	return nil
+}
+
+func (s *StreamingPacket) PackageAssembly(key, salt []byte) (err error) {
+	if s.typePacket != PlainPacket {
+		return errors.New("this operation is available only for the PlainPacket package type")
+	}
+
+	s.salt = salt
+	var nonce []byte
+	plainDataWithSalt := make([]byte, len(s.plainData)+len(salt))
+	copy(plainDataWithSalt[:len(salt)], salt)
+	copy(plainDataWithSalt[len(salt):], s.plainData)
+
+	s.cipherData, nonce, err = crypto.EncryptChaCha20Poly1305(plainDataWithSalt, key)
+	if err != nil {
+		return fmt.Errorf("packet decryption error: %v", err)
+	}
+
+	s.rawData = make([]byte, len(s.cipherData)+len(nonce)+2+2) // size CipherData + size Nonce + size length RawData + size length CipherData
+
+	binary.BigEndian.PutUint16(s.rawData[2:4], uint16(len(s.cipherData)+len(nonce)+2))
+	copy(s.rawData[4:16], nonce)
+	copy(s.rawData[16:], s.cipherData)
+
+	s.rawData = crypto.Trashfication(s.rawData, 300, 1500)
+
+	binary.BigEndian.PutUint16(s.rawData[:2], uint16(len(s.rawData)))
+
+	s.rawData[0] = s.rawData[0] ^ key[0]
+	s.rawData[1] = s.rawData[1] ^ key[1]
+	s.rawData[2] = s.rawData[2] ^ key[2]
+	s.rawData[3] = s.rawData[3] ^ key[3]
+
+	return nil
+}
+
+func (s *StreamingPacket) DecodeAndDecrypt(key []byte, withSalt bool) (err error) {
+	if s.typePacket != RawPacket {
+		return errors.New("this operation is available only for the RawPacket package type")
+	}
+
+	lengthCipherDataBytes := s.rawData[2:4]
+	lengthCipherDataBytes[0] = lengthCipherDataBytes[0] ^ key[2]
+	lengthCipherDataBytes[1] = lengthCipherDataBytes[1] ^ key[3]
+
+	lengthCipherData := binary.BigEndian.Uint16(lengthCipherDataBytes)
+	s.cipherData = s.rawData[4 : lengthCipherData+2]
+
+	s.plainData, err = crypto.DecryptChaCha20Poly1305(s.cipherData[12:], s.cipherData[:12], key)
+	if err != nil {
+		return fmt.Errorf("packet encryption error: %v", err)
+	}
+
+	if withSalt {
+		s.salt = s.plainData[:8]
+		s.plainData = s.plainData[8:]
+	}
+
+	return nil
+}
+
+func (s *StreamingPacket) GetRawData() (data []byte) {
+	return s.rawData
+}
+
+func (s *StreamingPacket) GetSalt() (salt []byte) {
+	return s.salt
+}
+
+func (s *StreamingPacket) GetCipherData() (salt []byte) {
+	return s.cipherData
+}
+
+func (s *StreamingPacket) GetPlainData() (salt []byte) {
+	return s.plainData
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"smiletun-server/config"
+	"smiletun-server/crypto"
 	"smiletun-server/logger"
 	"smiletun-server/users"
 	"sync"
@@ -44,7 +45,6 @@ func NewServer(cfg *config.Config, usersDB *users.Users, logger *logger.Logger) 
 
 func (s *Server) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
-	s.logger.Info("Starting TCP server on %s", addr)
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -53,7 +53,6 @@ func (s *Server) Start() error {
 	}
 
 	s.listener = listener
-	s.logger.Info("TCP proxy server listening on %s", addr)
 
 	s.tunnel, err = NewTunnel(
 		"tun0",
@@ -76,30 +75,26 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	s.logger.Debug("Starting accept connections goroutine")
 	go s.acceptConnections()
 
-	s.logger.Debug("Starting cleanup idle clients goroutine")
+	go s.tunnelReader()
+
 	go s.cleanupIdleClients()
 
-	s.logger.Info("Server started successfully")
 	return nil
 }
 
 func (s *Server) acceptConnections() {
-	s.logger.Debug("Accept connections loop started")
 
 	for {
 		select {
 		case <-s.stopCh:
-			s.logger.Info("Accept connections loop stopped by stop signal")
 			return
 		default:
 			conn, err := s.listener.Accept()
 			if err != nil {
 				select {
 				case <-s.stopCh:
-					s.logger.Debug("Accept interrupted during shutdown")
 					return
 				default:
 					s.logger.Error("Failed to accept connection: %v", err)
@@ -112,17 +107,13 @@ func (s *Server) acceptConnections() {
 			maxClients := s.config.MaxClients
 			s.mu.RUnlock()
 
-			s.logger.Debug("New connection from %s, current clients: %d/%d", conn.RemoteAddr(), clientCount, maxClients)
-
 			if clientCount >= maxClients {
-				s.logger.Debug("Max clients reached (%d/%d), rejecting connection from %s", clientCount, maxClients, conn.RemoteAddr())
 				conn.Close()
 				continue
 			}
 
 			s.wg.Add(1)
 			s.incrementClientCount()
-			s.logger.Debug("Starting handle connection goroutine for %s", conn.RemoteAddr())
 
 			go s.handleConnection(conn)
 		}
@@ -130,14 +121,9 @@ func (s *Server) acceptConnections() {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	clientAddr := conn.RemoteAddr().String()
-	s.logger.Info("Handling new connection from %s", clientAddr)
-
 	defer func() {
-		s.logger.Debug("Closing connection from %s", clientAddr)
 		s.wg.Done()
 		s.decrementClientCount()
-		s.logger.Info("Connection from %s closed", clientAddr)
 	}()
 
 	connTCP := conn.(*net.TCPConn)
@@ -174,57 +160,86 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	s.logger.Info("New client registered: %s", clientAddr)
-
-	s.logger.Debug("Adding client %s to clients map", clientAddr)
 	s.clients[clientIP.String()] = client
 
-	s.logger.Debug("Removing read deadline for %s", clientAddr)
 	conn.SetDeadline(time.Time{})
 
-	s.logger.Debug("Starting client handler goroutine for %s", clientAddr)
 	go s.handleClient(client)
+}
+
+func (s *Server) tunnelReader() {
+	for {
+		rawPacket := make([]byte, 65535)
+		n, err := s.tunnel.Read(rawPacket)
+		if err != nil {
+			s.logger.Error("Failed to read from tunnel: %v", err)
+			continue
+		}
+		rawPacket = rawPacket[:n]
+
+		dstIP := rawPacket[16:20]
+
+		s.mu.Lock()
+		client, ok := s.clients[fmt.Sprintf("%d.%d.%d.%d", dstIP[0], dstIP[1], dstIP[2], dstIP[3])]
+		s.mu.Unlock()
+		if !ok {
+			continue
+		}
+
+		salt := crypto.RandomBytes(8)
+
+		packet := NewPlainPacket()
+		packet.AddData(rawPacket)
+		packet.PackageAssembly(client.sessionSentKey, salt)
+
+		_, err = client.conn.Write(packet.GetRawData())
+		if err != nil {
+			s.logger.Error("Error write: %v", err)
+			continue
+		}
+
+		client.computeNextSessionSentKey(salt)
+		client.countSent++
+	}
 }
 
 func (s *Server) handleClient(client *Client) {
 	defer client.conn.Close()
 	clientAddr := client.addr
-	s.logger.Info("Starting client handler for %s", clientAddr)
 
 	for {
 		select {
 		case <-s.stopCh:
-			s.logger.Info("Client handler for %s stopped by server shutdown", clientAddr)
 			return
 		default:
-			packet, err := client.ReadAndDecryptStreamingPacket()
+			packet, err := client.readPacket()
 			if err != nil {
-				s.logger.Error("Failed to read and decrypt packet from %s: %v", client.addr, err)
+				s.logger.Error("%v", err)
 				if err.Error() == "EOF" {
 					return
 				}
 				continue
 			}
+			err = packet.DecodeAndDecrypt(client.sessionRecvKey, true)
+			if err != nil {
+				s.logger.Error("%v", err)
+				continue
+			}
 
 			client.countRecv++
-			client.computeNextSessionRecvKey(packet.Salt)
-
-			s.logger.Info("Decrypted packet #%d from %s (size: %d bytes)", client.countRecv, clientAddr, len(packet.Data))
-			s.logger.Trace("Plaintext data from %s: %x", clientAddr, packet.Data)
+			client.computeNextSessionRecvKey(packet.GetSalt())
 
 			client.mu.Lock()
 			client.lastActive = time.Now()
-			client.countRecvBytes += uint32(len(packet.Data))
+			client.countRecvBytes += uint32(len(packet.GetRawData()))
 			client.mu.Unlock()
 
-			_, err = s.tunnel.Write(packet.Data[8:])
+			packetForTunnel := packet.GetPlainData()
+
+			_, err = s.tunnel.Write(packetForTunnel)
 			if err != nil {
 				s.logger.Error("Write error to TUN interface for %s: %v", clientAddr, err)
 			}
-
-			s.logger.Debug("Client %s stats updated - received: %d bytes, total packets: %d",
-				clientAddr, client.countRecvBytes, client.countRecv)
-			s.logger.Debug("______________________________________________________________________________")
 		}
 	}
 }
@@ -237,29 +252,21 @@ func (s *Server) cleanupIdleClients() {
 	for {
 		select {
 		case <-s.stopCh:
-			s.logger.Info("Cleanup idle clients loop stopped")
 			return
 		case <-ticker.C:
-			s.logger.Debug("Running idle clients cleanup check")
 
 			s.mu.Lock()
 			idleCount := 0
 			for addr, client := range s.clients {
 				idleTime := time.Since(client.lastActive)
 				if idleTime > 10*time.Minute {
-					s.logger.Info("Closing idle client: %s (idle for %v)", addr, idleTime)
 					client.conn.Close()
+					s.ipPool.ReleaseIP(*client.localIP)
 					delete(s.clients, addr)
 					idleCount++
 				}
 			}
 			s.mu.Unlock()
-
-			if idleCount > 0 {
-				s.logger.Info("Closed %d idle clients", idleCount)
-			} else {
-				s.logger.Debug("No idle clients found")
-			}
 		}
 	}
 }
@@ -268,19 +275,16 @@ func (s *Server) incrementClientCount() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clientCount++
-	s.logger.Debug("Client count incremented to %d", s.clientCount)
 }
 
 func (s *Server) decrementClientCount() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clientCount--
-	s.logger.Debug("Client count decremented to %d", s.clientCount)
 }
 
 func (s *Server) GetClientCount() int32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	s.logger.Trace("GetClientCount called, returning %d", s.clientCount)
 	return s.clientCount
 }
