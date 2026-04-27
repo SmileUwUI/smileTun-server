@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/ecdh"
 	"crypto/sha256"
 	"encoding/binary"
 	"net"
@@ -11,21 +12,24 @@ import (
 )
 
 type Client struct {
-	addr            string
-	conn            *net.TCPConn
-	user            *users.User
-	countRecv       uint32
-	countSent       uint32
-	countRecvBytes  uint32
-	countSentBytes  uint32
-	sessionSentKey  []byte
-	sessionRecvKey  []byte
-	createdAt       time.Time
-	lastActive      time.Time
-	logger          *logger.Logger
-	maxPacketLength uint16
-	localIP         *net.IP
-	mu              sync.RWMutex
+	addr                      string
+	conn                      *net.TCPConn
+	user                      *users.User
+	countRecv                 uint32
+	countSent                 uint32
+	countRecvBytes            uint32
+	countSentBytes            uint32
+	sessionSentKey            []byte
+	sessionRecvKey            []byte
+	createdAt                 time.Time
+	lastActive                time.Time
+	lastRoundECDH             time.Time
+	roundECDHLock             chan struct{}
+	ephemeralPrivateServerKey *ecdh.PrivateKey
+	logger                    *logger.Logger
+	maxPacketLength           uint16
+	localIP                   *net.IP
+	mu                        sync.RWMutex
 }
 
 func (c *Client) computeNextSessionRecvKey(salt []byte) {

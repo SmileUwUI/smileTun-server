@@ -1,7 +1,10 @@
 package server
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
 	"fmt"
+	"math"
 	"net"
 	"smiletun-server/config"
 	"smiletun-server/crypto"
@@ -100,6 +103,8 @@ func (s *Server) acceptConnections() {
 					continue
 				}
 			}
+			addr := conn.RemoteAddr().String()
+			s.logger.Info("New connection from %s", addr)
 
 			s.mu.RLock()
 			clientCount := int(s.clientCount)
@@ -107,6 +112,7 @@ func (s *Server) acceptConnections() {
 			s.mu.RUnlock()
 
 			if clientCount >= maxClients {
+				s.logger.Error("Connection from %s was rejected because the server is full", addr)
 				conn.Close()
 				continue
 			}
@@ -127,6 +133,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	connTCP := conn.(*net.TCPConn)
 	connTCP.SetNoDelay(true)
+	addr := connTCP.RemoteAddr().String()
 
 	now := time.Now()
 
@@ -141,20 +148,21 @@ func (s *Server) handleConnection(conn net.Conn) {
 		sessionSentKey:  []byte{},
 		createdAt:       now,
 		lastActive:      now,
+		lastRoundECDH:   now,
 		logger:          s.logger,
 		maxPacketLength: 4096,
 	}
 
 	err := client.handshakeStage1(s.config.InitPassword, s.users)
 	if err != nil {
-		s.logger.Error("Error during handshake: %v", err)
+		s.logger.Error("Error during handshake from %s: %v", addr, err)
 		return
 	}
 
 	clientIP := s.ipPool.AcquireIP()
 	err = client.handshakeStage2(&clientIP)
 	if err != nil {
-		s.logger.Error("Error during handshake: %v", err)
+		s.logger.Error("Error during handshake from %s: %v", addr, err)
 		s.ipPool.ReleaseIP(clientIP)
 		return
 	}
@@ -188,6 +196,10 @@ func (s *Server) tunnelReader() {
 			continue
 		}
 
+		if client.roundECDHLock != nil {
+			<-client.roundECDHLock
+		}
+
 		salt, err := crypto.RandomBytes(8)
 		if err != nil {
 			s.logger.Error("Salt generation error: %v", err)
@@ -196,7 +208,20 @@ func (s *Server) tunnelReader() {
 
 		packet := NewPlainPacket()
 		packet.AddData(rawPacket)
-		err = packet.PackageAssembly(client.sessionSentKey, salt, false, false)
+
+		if client.countSent >= uint32(math.Pow(2, 16)) || time.Since(client.lastRoundECDH) >= 4*time.Minute {
+			curve := ecdh.X25519()
+			privateKey, err := curve.GenerateKey(rand.Reader)
+			if err != nil {
+				s.logger.Error("Error generating the keypair")
+				return
+			}
+
+			client.ephemeralPrivateServerKey = privateKey
+			err = packet.PackageAssembly(client.sessionSentKey, salt, privateKey.PublicKey().Bytes(), false, true)
+		} else {
+			err = packet.PackageAssembly(client.sessionSentKey, salt, []byte{}, false, false)
+		}
 		if err != nil {
 			s.logger.Error("Error assembly a packet: %v", err)
 			continue
@@ -206,6 +231,9 @@ func (s *Server) tunnelReader() {
 		if err != nil {
 			s.logger.Error("Error write: %v", err)
 			continue
+		}
+		if packet.GetEcdhFlag() {
+			client.roundECDHLock = make(chan struct{}, 1)
 		}
 
 		client.computeNextSessionSentKey(salt)
@@ -238,6 +266,31 @@ func (s *Server) handleClient(client *Client) {
 
 			client.countRecv++
 			client.computeNextSessionRecvKey(packet.GetSalt())
+
+			if packet.GetEcdhFlag() && client.ephemeralPrivateServerKey != nil {
+				s.logger.Debug("A new round of the ECDH has begun")
+				curve := ecdh.X25519()
+				clientPublicKey, err := curve.NewPublicKey(packet.GetPublicKey())
+				if err != nil {
+					s.logger.Error("Error parsing the client's public key: %v", err)
+					return
+				}
+
+				secret, err := client.ephemeralPrivateServerKey.ECDH(clientPublicKey)
+				if err != nil {
+					s.logger.Error("ECDH execution error: %v", err)
+					return
+				}
+				client.ephemeralPrivateServerKey = nil
+				client.lastRoundECDH = time.Now()
+
+				client.countRecv = 0
+				client.countSent = 0
+
+				client.computeNextSessionSentKey(secret)
+				client.computeNextSessionRecvKey(secret)
+				close(client.roundECDHLock)
+			}
 
 			client.mu.Lock()
 			client.lastActive = time.Now()

@@ -136,17 +136,10 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 		return fmt.Errorf("the client rejected the connection")
 	}
 
-	publicClientKeyBytes, err := packet.GetSlicePlainData(1, packet.GetSizePlainData())
-	if err != nil {
-		c.logger.Error("Error retrieving the second salt: %v", err)
-		c.conn.Close()
-		return err
-	}
-
 	curve := ecdh.X25519()
 
 	c.logger.Debug("Parsing the client's public key")
-	publicClientKey, err := curve.NewPublicKey(publicClientKeyBytes)
+	publicClientKey, err := curve.NewPublicKey(packet.GetPublicKey())
 	if err != nil {
 		c.logger.Error("Error parsing the client's public key: %v", err)
 		return err
@@ -163,8 +156,7 @@ func (c *Client) handshakeStage2(clientIP *net.IP) (err error) {
 
 	ipPacket := NewPlainPacket()
 	ipPacket.AddData(clientIP.To4())
-	ipPacket.AddData(publicServerKey.Bytes())
-	err = ipPacket.PackageAssembly(c.sessionSentKey, []byte{}, []byte{}, false, false)
+	err = ipPacket.PackageAssembly(c.sessionSentKey, []byte{}, publicServerKey.Bytes(), false, true)
 	if err != nil {
 		c.logger.Error("Error assembly a ip packet: %v", err)
 		c.conn.Close()
