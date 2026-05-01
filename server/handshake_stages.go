@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"smiletun-server/crypto"
 	"smiletun-server/users"
@@ -13,6 +14,11 @@ import (
 )
 
 func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err error) {
+	err = c.conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if err != nil {
+		c.logger.Error("%v", err)
+		return err
+	}
 	c.conn.SetDeadline(time.Now().Add(15 * time.Second))
 	c.sessionRecvKey = initPassword[:]
 	c.sessionSentKey = initPassword[:]
@@ -38,6 +44,12 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 		return err
 	}
 
+	timestamp := binary.BigEndian.Uint64(timestampBytes)
+	currentTime := time.Now().Unix()
+	if timestamp > math.MaxInt64 {
+		return fmt.Errorf("timestamp overflow")
+	}
+	timeDiff := currentTime - int64(timestamp)
 	timestamp := int64(binary.BigEndian.Uint64(timestampBytes))
 	currentTime := time.Now().Unix()
 	timeDiff := currentTime - timestamp
