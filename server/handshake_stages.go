@@ -50,9 +50,6 @@ func (c *Client) handshakeStage1(initPassword [32]byte, users *users.Users) (err
 		return fmt.Errorf("timestamp overflow")
 	}
 	timeDiff := currentTime - int64(timestamp)
-	timestamp := int64(binary.BigEndian.Uint64(timestampBytes))
-	currentTime := time.Now().Unix()
-	timeDiff := currentTime - timestamp
 
 	if timeDiff > 5 {
 		c.conn.Close()
