@@ -113,7 +113,7 @@ func (u *Users) Save() (err error) {
 	}
 
 	content := strings.Join(lines, "\n")
-	if err := os.WriteFile(u.path, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(u.path, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to save users file: %w", err)
 	}
 

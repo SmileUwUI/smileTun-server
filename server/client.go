@@ -14,7 +14,7 @@ import (
 type Client struct {
 	addr                      string
 	conn                      *net.TCPConn
-	user                      *users.User //nolint:unused
+	user                      *users.User //nolint:unus
 	countRecv                 uint32
 	countSent                 uint32
 	countRecvBytes            uint32
