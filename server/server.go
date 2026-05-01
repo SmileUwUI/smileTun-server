@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/ecdh"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -132,7 +133,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}()
 
 	connTCP := conn.(*net.TCPConn)
-	connTCP.SetNoDelay(true)
 	addr := connTCP.RemoteAddr().String()
 
 	now := time.Now()
@@ -222,6 +222,7 @@ func (s *Server) tunnelReader() {
 		} else {
 			err = packet.PackageAssembly(client.sessionSentKey, salt, []byte{}, false, false)
 		}
+
 		if err != nil {
 			s.logger.Error("Error assembly a packet: %v", err)
 			continue
@@ -229,9 +230,15 @@ func (s *Server) tunnelReader() {
 
 		_, err = client.conn.Write(packet.GetRawData())
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				s.ipPool.ReleaseIP(*client.localIP)
+				delete(s.clients, client.localIP.String())
+				continue
+			}
 			s.logger.Error("Error write: %v", err)
 			continue
 		}
+
 		if packet.GetEcdhFlag() {
 			client.roundECDHLock = make(chan struct{}, 1)
 		}
@@ -252,13 +259,22 @@ func (s *Server) handleClient(client *Client) {
 		default:
 			packet, err := client.readPacket()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					s.ipPool.ReleaseIP(*client.localIP)
+					delete(s.clients, client.localIP.String())
+					return
+				}
+
 				s.logger.Error("%v", err)
 				if err.Error() == "EOF" {
+					s.ipPool.ReleaseIP(*client.localIP)
+					delete(s.clients, client.localIP.String())
 					return
 				}
 				continue
 			}
 			err = packet.DecodeAndDecrypt(client.sessionRecvKey, true)
+
 			if err != nil {
 				s.logger.Error("%v", err)
 				continue
@@ -297,9 +313,7 @@ func (s *Server) handleClient(client *Client) {
 			client.countRecvBytes += uint32(len(packet.GetRawData()))
 			client.mu.Unlock()
 
-			packetForTunnel := packet.GetPlainData()
-
-			_, err = s.tunnel.Write(packetForTunnel)
+			_, err = s.tunnel.Write(packet.GetPlainData())
 			if err != nil {
 				s.logger.Error("Write error to TUN interface for %s: %v", clientAddr, err)
 			}

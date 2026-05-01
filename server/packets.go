@@ -119,6 +119,9 @@ func (s *StreamingPacket) DecodeAndDecrypt(key []byte, withSalt bool) (err error
 	}
 
 	lengthCipherData := binary.BigEndian.Uint16(lengthCipherDataBytes)
+	if int(lengthCipherData+3) > len(s.rawData) {
+		return fmt.Errorf("invalid length")
+	}
 	s.cipherData = s.rawData[5 : lengthCipherData+3]
 
 	s.plainData, err = crypto.DecryptChaCha20Poly1305(s.cipherData[12:], s.cipherData[:12], key)
@@ -174,7 +177,7 @@ func (s *StreamingPacket) GetSlicePlainData(start, end int) (slicePlainData []by
 	}
 
 	if len(s.plainData) == 0 {
-		return nil, errors.New("The size of `plainData` cannot be 0")
+		return nil, errors.New("the size of `plainData` cannot be 0")
 	}
 
 	if start < 0 {
