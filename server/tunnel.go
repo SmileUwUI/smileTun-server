@@ -28,7 +28,7 @@ type TunnelStats struct {
 	LastError error
 }
 
-func NewTunnel(name string, mtu int, address net.IP, netmask net.IPMask, routes []*net.IPNet) (*LinuxTunnel, error) {
+func NewTunnel(name string, mtu int, address net.IP, netmask net.IPMask) (*LinuxTunnel, error) {
 	waterConfig := water.Config{
 		DeviceType: water.TUN,
 	}
@@ -56,7 +56,10 @@ func NewTunnel(name string, mtu int, address net.IP, netmask net.IPMask, routes 
 	}
 
 	if mtu > 0 {
-		tunnel.SetMTU(mtu)
+		err = tunnel.SetMTU(mtu)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return tunnel, nil
@@ -97,12 +100,17 @@ func (t *LinuxTunnel) SetIP(ip net.IP, netmask net.IPMask) error {
 	defer t.mu.Unlock()
 
 	if t.ip != nil {
-		exec.Command("ip", "addr", "del",
+		// #nosec G204
+		err := exec.Command("ip", "addr", "del",
 			fmt.Sprintf("%s/%d", t.ip, t.getPrefixLen()),
 			"dev", t.name).Run()
+		if err != nil {
+			return err
+		}
 	}
 
 	prefixLen, _ := netmask.Size()
+	// #nosec G204
 	cmd := exec.Command("ip", "addr", "add",
 		fmt.Sprintf("%s/%d", ip.String(), prefixLen),
 		"dev", t.name)
@@ -116,6 +124,7 @@ func (t *LinuxTunnel) SetIP(ip net.IP, netmask net.IPMask) error {
 }
 
 func (t *LinuxTunnel) SetMTU(mtu int) error {
+	// #nosec G204
 	cmd := exec.Command("ip", "link", "set", "dev", t.name, "mtu", fmt.Sprintf("%d", mtu))
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to set MTU: %w", err)
@@ -125,6 +134,7 @@ func (t *LinuxTunnel) SetMTU(mtu int) error {
 }
 
 func (t *LinuxTunnel) Up() error {
+	// #nosec G204
 	cmd := exec.Command("ip", "link", "set", "dev", t.name, "up")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to bring up interface: %w", err)
@@ -134,6 +144,7 @@ func (t *LinuxTunnel) Up() error {
 }
 
 func (t *LinuxTunnel) Down() error {
+	// #nosec G204
 	cmd := exec.Command("ip", "link", "set", "dev", t.name, "down")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to bring down interface: %w", err)
@@ -143,7 +154,11 @@ func (t *LinuxTunnel) Down() error {
 }
 
 func (t *LinuxTunnel) Close() error {
-	t.Down()
+	err := t.Down()
+	if err != nil {
+		return err
+	}
+
 	return t.iface.Close()
 }
 
@@ -169,6 +184,6 @@ func (t *LinuxTunnel) getPrefixLen() int {
 	if t.netmask == nil {
 		return 24
 	}
-	len, _ := t.netmask.Size()
-	return len
+	size, _ := t.netmask.Size()
+	return size
 }

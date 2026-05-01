@@ -63,9 +63,6 @@ func (s *Server) Start() error {
 		1500,
 		net.ParseIP("10.8.83.1"),
 		net.IPv4Mask(255, 255, 255, 0),
-		[]*net.IPNet{
-			{IP: net.ParseIP("0.0.0.0"), Mask: net.CIDRMask(0, 32)},
-		},
 	)
 
 	if err != nil {
@@ -169,7 +166,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	s.clients[clientIP.String()] = client
 
-	conn.SetDeadline(time.Time{})
+	err = conn.SetDeadline(time.Time{})
+	if err != nil {
+		s.logger.Error("%v", err)
+		return
+	}
 
 	go s.handleClient(client)
 }
@@ -219,13 +220,18 @@ func (s *Server) tunnelReader() {
 
 			client.ephemeralPrivateServerKey = privateKey
 			err = packet.PackageAssembly(client.sessionSentKey, salt, privateKey.PublicKey().Bytes(), false, true)
+
+			if err != nil {
+				s.logger.Error("Error assembly a packet: %v", err)
+				continue
+			}
 		} else {
 			err = packet.PackageAssembly(client.sessionSentKey, salt, []byte{}, false, false)
-		}
 
-		if err != nil {
-			s.logger.Error("Error assembly a packet: %v", err)
-			continue
+			if err != nil {
+				s.logger.Error("Error assembly a packet: %v", err)
+				continue
+			}
 		}
 
 		_, err = client.conn.Write(packet.GetRawData())
@@ -310,7 +316,13 @@ func (s *Server) handleClient(client *Client) {
 
 			client.mu.Lock()
 			client.lastActive = time.Now()
-			client.countRecvBytes += uint32(len(packet.GetRawData()))
+
+			countRecv := len(packet.GetRawData())
+			if countRecv < 0 {
+				countRecv = 0
+			}
+
+			client.countRecvBytes += uint32(countRecv)
 			client.mu.Unlock()
 
 			ipSrc, err := packet.GetSlicePlainData(12, 16)

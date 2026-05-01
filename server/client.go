@@ -14,7 +14,7 @@ import (
 type Client struct {
 	addr                      string
 	conn                      *net.TCPConn
-	user                      *users.User
+	user                      *users.User //nolint:unused
 	countRecv                 uint32
 	countSent                 uint32
 	countRecvBytes            uint32
@@ -86,6 +86,10 @@ func (c *Client) read(length uint16) (data []byte, err error) {
 		if err != nil {
 			return nil, err
 		}
+		if n < 0 {
+			n = 0
+		}
+
 		remaining -= uint16(n)
 		offset += n
 	}
