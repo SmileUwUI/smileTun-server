@@ -313,6 +313,15 @@ func (s *Server) handleClient(client *Client) {
 			client.countRecvBytes += uint32(len(packet.GetRawData()))
 			client.mu.Unlock()
 
+			ipSrc, err := packet.GetSlicePlainData(12, 16)
+			if err != nil {
+				s.logger.Error("Error retrieving source IP address: %v", err)
+				continue
+			}
+			if fmt.Sprintf("%d.%d.%d.%d", ipSrc[0], ipSrc[1], ipSrc[2], ipSrc[3]) != client.localIP.String() {
+				continue
+			}
+
 			_, err = s.tunnel.Write(packet.GetPlainData())
 			if err != nil {
 				s.logger.Error("Write error to TUN interface for %s: %v", clientAddr, err)
